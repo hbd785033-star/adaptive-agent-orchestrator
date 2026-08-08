@@ -14,10 +14,12 @@ Protocol:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
-from typing import Any, AsyncIterator
+from typing import Any
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -33,7 +35,6 @@ from contracts.result import (
     Usage,
 )
 from contracts.task import TaskContract
-
 
 # ── Event type → typed payload parser ────────────────────────────────────────
 
@@ -54,10 +55,9 @@ def _parse_event(raw: dict) -> AgentEvent:
     )
     parser = _TYPED_PARSERS.get(event.type)
     if parser:
-        try:
+        with contextlib.suppress(Exception):
             event.typed_payload = parser(**event.payload)
-        except Exception:
-            pass  # keep raw payload; don't break the stream
+            # keep raw payload if parse fails; don't break the stream
     return event
 
 
@@ -115,10 +115,9 @@ class HermesAdapter:
     async def _reconnect(self) -> None:
         self._connected.clear()
         await asyncio.sleep(self._reconnect_delay)
-        try:
+        with contextlib.suppress(Exception):
             await self.connect()
-        except Exception:
-            pass  # retry handled by caller
+            # retry handled by caller if this also fails
 
     # ── Receive loop (fan-out) ────────────────────────────────────────────────
 

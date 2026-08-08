@@ -72,8 +72,6 @@ class TaskProfiler:
         from orchestrator.router import estimate_input_tokens
 
         goal_lower = task.goal.lower()
-        context_text = str(task.context)
-
         # Token estimate
         estimated_tokens = estimate_input_tokens(task)
 

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import pytest
-from orchestrator.budget import BudgetConfig, BudgetState, BudgetViolation, ApprovalGate
-from contracts.task import TaskContract, RiskLevel, TaskType
+
+from contracts.task import RiskLevel, TaskContract
+from orchestrator.budget import ApprovalGate, BudgetConfig, BudgetState, BudgetViolation
 
 
 @pytest.fixture

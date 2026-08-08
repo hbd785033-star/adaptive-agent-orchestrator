@@ -7,11 +7,12 @@ without requiring a live Hermes instance.
 """
 from __future__ import annotations
 
-import pytest
 from pathlib import Path
 
+import pytest
+
 from adapters.mock import MockHermesAdapter
-from contracts.task import TaskContract, TaskType, RiskLevel
+from contracts.task import TaskContract, TaskType
 from orchestrator.engine import Orchestrator
 
 

@@ -8,17 +8,15 @@ States:
 """
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
-from enum import Enum
-from pathlib import Path
+from enum import StrEnum
 from typing import Any
 
 from contracts.task import TaskContract
 from storage.database import Database
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     RECEIVED   = "received"
     PROFILED   = "profiled"
     ROUTED     = "routed"

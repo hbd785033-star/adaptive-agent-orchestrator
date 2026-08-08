@@ -14,13 +14,10 @@ secrets, budget checks) — this guard and the eval gate are complementary.
 """
 from __future__ import annotations
 
-import textwrap
 from copy import deepcopy
 from pathlib import Path
-from typing import Optional
 
 from contracts.task import TaskContract, WorkspaceSpec
-
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -28,8 +25,8 @@ from contracts.task import TaskContract, WorkspaceSpec
 
 def inject_constraints(
     task: TaskContract,
-    worktree_path: Optional[Path] = None,
-    child_id: Optional[str] = None,
+    worktree_path: Path | None = None,
+    child_id: str | None = None,
 ) -> TaskContract:
     """
     Return a *copy* of `task` with constraints encoded into the goal text.
@@ -63,8 +60,8 @@ def inject_constraints(
 
 def _build_constraints_block(
     task: TaskContract,
-    worktree_path: Optional[Path],
-    child_id: Optional[str],
+    worktree_path: Path | None,
+    child_id: str | None,
 ) -> str:
     """Build a human-readable constraints section to append to the goal."""
     lines: list[str] = []
@@ -83,7 +80,7 @@ def _build_constraints_block(
         task.workspace.path if task.workspace else None
     )
     if effective_path:
-        lines.append(f"### Workspace")
+        lines.append("### Workspace")
         lines.append(f"Work exclusively inside: `{effective_path}`")
         if child_id:
             lines.append(f"Your agent ID: `{child_id}`")

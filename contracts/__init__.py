@@ -1,6 +1,6 @@
-from .task import TaskContract, TaskType, RiskLevel, WorkspaceSpec
+from .evaluation import EvalCheck, EvalResult, EvalStatus
 from .result import AgentResult, RunHandle, RunStatus, Usage
-from .evaluation import EvalResult, EvalCheck, EvalStatus
+from .task import RiskLevel, TaskContract, TaskType, WorkspaceSpec
 
 __all__ = [
     "TaskContract", "TaskType", "RiskLevel", "WorkspaceSpec",

@@ -8,8 +8,6 @@ Flow per task:
 """
 from __future__ import annotations
 
-import asyncio
-import uuid
 from pathlib import Path
 
 import structlog
@@ -17,13 +15,13 @@ import structlog
 from adapters.runtime import AgentRuntime
 from contracts.evaluation import EvalStatus
 from contracts.result import RunStatus
-from contracts.task import TaskContract, TaskType
+from contracts.task import TaskContract
 from evals.gate import DeterministicEvalGate
 from orchestrator.budget import ApprovalGate, BudgetConfig, BudgetState
 from orchestrator.profiler import TaskProfiler
-from orchestrator.router import RuleRouter
-from orchestrator.state_machine import StateMachine, TaskRecord, TaskStatus
 from orchestrator.prompt_guard import inject_constraints, split_for_delegation
+from orchestrator.router import RuleRouter
+from orchestrator.state_machine import StateMachine, TaskRecord
 from orchestrator.workspace import WorkspaceManager
 from storage.database import Database
 from telemetry.events import TelemetryRecorder
@@ -71,7 +69,7 @@ class Orchestrator:
         db_path: str = "data/orchestrator.db",
         repo_path: str = ".",
         policy_path: str = "policies/default.yaml",
-    ) -> "Orchestrator":
+    ) -> Orchestrator:
         import yaml
         db = Database(Path(db_path))
         await db.connect()
@@ -109,7 +107,7 @@ class Orchestrator:
     async def close(self) -> None:
         await self._db.close()
 
-    async def __aenter__(self) -> "Orchestrator":
+    async def __aenter__(self) -> Orchestrator:
         return self
 
     async def __aexit__(self, *_) -> None:
@@ -175,8 +173,7 @@ class Orchestrator:
 
         # 4. Workspace allocation (write tasks only)
         worktrees: list[tuple[str, Path]] = []  # [(child_id, path)]
-        if self._wm and self._wm.needs_worktree(task.task_type.value):
-            if decision.route == "delegation":
+        if self._wm and self._wm.needs_worktree(task.task_type.value) and decision.route == "delegation":
                 for i in range(budget.config.max_children):
                     child_id = f"child-{i+1}"
                     wt = self._wm.allocate(task.id, child_id)
@@ -204,9 +201,7 @@ class Orchestrator:
         await self._tel.record(task.id, "task_submitted", {"run_id": handle.run_id}, handle.run_id)
 
         # Stream events → collect tool calls, watch for approval requests
-        last_event_id: str | None = None
         async for event in self._runtime.events(handle.run_id):
-            last_event_id = event.id
             await self._tel.record(task.id, f"event_{event.type}", event.payload, handle.run_id)
 
             if event.type == "approval_request":

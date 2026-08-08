@@ -1,11 +1,10 @@
 """Tests for DeterministicEvalGate — paths and budget checks (sync)."""
 from __future__ import annotations
 
-import pytest
 from contracts.evaluation import EvalStatus
 from contracts.result import AgentResult, RunStatus, Usage
-from contracts.task import TaskContract, RiskLevel
-from evals.gate import check_paths, check_budget
+from contracts.task import TaskContract
+from evals.gate import check_budget, check_paths
 from orchestrator.budget import BudgetConfig, BudgetState
 
 

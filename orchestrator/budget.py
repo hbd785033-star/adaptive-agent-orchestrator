@@ -11,12 +11,10 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
-from typing import Literal
 
 import yaml
 
-from contracts.task import TaskContract, RiskLevel
-
+from contracts.task import TaskContract
 
 # ── Budget ────────────────────────────────────────────────────────────────────
 
@@ -39,7 +37,7 @@ class BudgetState:
     calls_used: int = 0
     depth_used: int = 0
 
-    def check_children(self) -> "BudgetViolation | None":
+    def check_children(self) -> BudgetViolation | None:
         if self.children_used >= self.config.max_children:
             return BudgetViolation(
                 "max_children",
@@ -47,7 +45,7 @@ class BudgetState:
             )
         return None
 
-    def check_retries(self) -> "BudgetViolation | None":
+    def check_retries(self) -> BudgetViolation | None:
         if self.retries_used >= self.config.max_retries:
             return BudgetViolation(
                 "max_retries",
@@ -55,7 +53,7 @@ class BudgetState:
             )
         return None
 
-    def check_calls(self) -> "BudgetViolation | None":
+    def check_calls(self) -> BudgetViolation | None:
         if self.calls_used >= self.config.max_total_calls:
             return BudgetViolation(
                 "max_total_calls",

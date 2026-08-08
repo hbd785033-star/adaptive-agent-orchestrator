@@ -19,13 +19,13 @@ import json
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
+from datetime import UTC
 from pathlib import Path
 
-import yaml
 import websockets
+import yaml
 from websockets.exceptions import ConnectionClosed
-
 
 # ── Result tracking ───────────────────────────────────────────────────────────
 
@@ -262,10 +262,10 @@ async def check_interrupt(client: GatewayClient) -> CheckResult:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def run_spike(url: str, api_key: str | None) -> SpikeReport:
-    from datetime import datetime, timezone
-    report = SpikeReport(hermes_url=url, timestamp=datetime.now(timezone.utc).isoformat())
+    from datetime import datetime
+    report = SpikeReport(hermes_url=url, timestamp=datetime.now(UTC).isoformat())
 
-    print(f"\n🔍 Phase 0 — Hermes Gateway Spike")
+    print("\n🔍 Phase 0 — Hermes Gateway Spike")
     print(f"   Target: {url}\n")
 
     # ⓪ WebSocket connect (standalone — needs no session)
@@ -357,7 +357,7 @@ def main() -> None:
     else:
         failed = [r.name for r in report.blockers if r.status != "pass"]
         print(f"❌  {len(failed)} blocker(s) FAILED: {failed}")
-        print(f"   Fix these before building the Orchestrator.")
+        print("   Fix these before building the Orchestrator.")
         print(f"   Report: {out_path}")
         sys.exit(1)
 

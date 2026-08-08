@@ -1,69 +1,204 @@
-# Routing test cases — used to evaluate and compare routing policy versions.
-#
-# Each entry is a labelled example: given the task attributes, what route
-# should the router choose?  Run `aao eval-routing` to score the current
-# policy against these cases.
-#
-# Fields:
-#   id          — unique slug
-#   description — human note
-#   task        — subset of TaskContract fields used by the profiler/router
-#   expected    — "single" or "delegation"
+# Routing test cases — v1.0
+# Run: aao eval-routing --dataset datasets/routing_cases.yaml
+# Each case provides task attributes that override profiler heuristics,
+# plus the expected_route the policy should choose.
+
+policy_version: "routing-v1.0"
 
 cases:
 
-  - id: simple_bug_fix
-    description: Single-file auth bug, low complexity
+  # ── SINGLE cases ──────────────────────────────────────────────────────────
+
+  - id: single-01-trivial-bug-fix
+    description: One-liner null-check fix in a single module
     task:
-      task_type: general
-      goal: "Fix NoneType error in src/auth/login.py"
+      goal: "Fix the NullPointerException in auth/login.py"
+      task_type: code_fix
+      risk: 1
       complexity: 1
+      has_sequential_dependency: false
       independent_subtask_count: 1
-      has_sequential_dependency: false
       affected_module_count: 1
-    expected: single
+    expected_route: single
 
-  - id: multi_module_refactor
-    description: Auth + payments refactor, two independent modules
+  - id: single-02-low-complexity-review
+    description: Code review of a single file — read-only, no parallelism
     task:
-      task_type: multi_file_refactor
-      goal: "Refactor auth and payments to use new session helper"
-      complexity: 3
-      independent_subtask_count: 2
-      has_sequential_dependency: false
-      affected_module_count: 2
-    expected: delegation
-
-  - id: large_research_task
-    description: Large context research, estimated tokens above threshold
-    task:
-      task_type: parallel_research
-      goal: "Survey all third-party API integrations and produce a risk matrix"
-      complexity: 4
-      independent_subtask_count: 1
-      has_sequential_dependency: false
-      affected_module_count: 1
-      estimated_input_tokens: 12000
-    expected: delegation
-
-  - id: sequential_dependency
-    description: Step B depends on step A output — must stay single
-    task:
-      task_type: general
-      goal: "Migrate DB schema then update all models to match"
-      complexity: 3
-      independent_subtask_count: 2
-      has_sequential_dependency: true
-      affected_module_count: 3
-    expected: single
-
-  - id: small_test_and_implement
-    description: Write tests + implement for one small feature
-    task:
-      task_type: test_and_implement
-      goal: "Add rate-limiting to /api/login and cover with tests"
+      goal: "Review auth/session.py for security issues"
+      task_type: code_review
+      risk: 2
       complexity: 2
-      independent_subtask_count: 2
       has_sequential_dependency: false
+      independent_subtask_count: 1
       affected_module_count: 1
-    expected: delegation
+    expected_route: single
+
+  - id: single-03-sequential-dependency
+    description: Migration then seed — second step depends on first completing
+    task:
+      goal: "Run database migration and then seed initial data"
+      task_type: general
+      risk: 3
+      complexity: 3
+      has_sequential_dependency: true
+      independent_subtask_count: 2
+      affected_module_count: 2
+      success_criteria:
+        - migration completes without errors
+        - seed data is present in the database
+    expected_route: single
+
+  - id: single-04-sequential-test-then-fix
+    description: Run tests, then fix the failures — ordering matters
+    task:
+      goal: "Run the test suite and fix any failing tests"
+      task_type: code_fix
+      risk: 1
+      complexity: 2
+      has_sequential_dependency: true
+      independent_subtask_count: 2
+      affected_module_count: 1
+    expected_route: single
+
+  - id: single-05-small-token-general
+    description: Small general task well under token threshold
+    task:
+      goal: "Update the README with installation instructions"
+      task_type: general
+      risk: 1
+      complexity: 1
+      has_sequential_dependency: false
+      independent_subtask_count: 1
+      affected_module_count: 1
+    expected_route: single
+
+  - id: single-06-medium-complexity-one-module
+    description: Medium complexity but only one module affected
+    task:
+      goal: "Refactor the payment module to use dependency injection"
+      task_type: code_fix
+      risk: 2
+      complexity: 3
+      has_sequential_dependency: false
+      independent_subtask_count: 1
+      affected_module_count: 1
+    expected_route: single
+
+  - id: single-07-research-read-only
+    description: >
+      parallel_research type triggers delegation by policy design even with 1 subtask.
+      If you want a read-only research task to stay single, use task_type=general instead.
+    task:
+      goal: "Summarise all open GitHub issues related to authentication"
+      task_type: parallel_research
+      risk: 1
+      complexity: 2
+      has_sequential_dependency: false
+      independent_subtask_count: 1
+      affected_module_count: 0
+    expected_route: delegation
+
+  # ── DELEGATION cases ──────────────────────────────────────────────────────
+
+  - id: delegation-01-multi-file-refactor
+    description: Rename across multiple independent modules — classic delegation
+    task:
+      goal: "Rename UserModel to AccountModel across auth/, billing/, and admin/ modules"
+      task_type: multi_file_refactor
+      risk: 2
+      complexity: 3
+      has_sequential_dependency: false
+      independent_subtask_count: 3
+      affected_module_count: 3
+    expected_route: delegation
+
+  - id: delegation-02-parallel-research
+    description: Research two independent topics concurrently
+    task:
+      goal: "Research OAuth2 best practices and also review competitor API docs"
+      task_type: parallel_research
+      risk: 1
+      complexity: 2
+      has_sequential_dependency: false
+      independent_subtask_count: 2
+      affected_module_count: 0
+    expected_route: delegation
+
+  - id: delegation-03-test-and-implement
+    description: Write tests and implementation in parallel
+    task:
+      goal: "Write unit tests for the payment module and implement the missing handlers"
+      task_type: test_and_implement
+      risk: 2
+      complexity: 3
+      has_sequential_dependency: false
+      independent_subtask_count: 2
+      affected_module_count: 2
+    expected_route: delegation
+
+  - id: delegation-04-large-token-estimate
+    description: Large context estimate pushes over token threshold
+    task:
+      goal: "Audit and update all API endpoint documentation and add OpenAPI annotations"
+      task_type: multi_file_refactor
+      risk: 2
+      complexity: 4
+      has_sequential_dependency: false
+      independent_subtask_count: 2
+      affected_module_count: 5
+    expected_route: delegation
+
+  - id: delegation-05-multi-module-code-fix
+    description: Bug spans multiple unrelated modules that can be fixed in parallel
+    task:
+      goal: "Fix the date formatting bug in both the export module and the report module"
+      task_type: multi_file_refactor
+      risk: 2
+      complexity: 2
+      has_sequential_dependency: false
+      independent_subtask_count: 2
+      affected_module_count: 2
+    expected_route: delegation
+
+  - id: delegation-06-high-subtask-count
+    description: Clearly three independent subtasks — well over threshold
+    task:
+      goal: "Add input validation to the user, product, and order API endpoints"
+      task_type: multi_file_refactor
+      risk: 2
+      complexity: 3
+      has_sequential_dependency: false
+      independent_subtask_count: 3
+      affected_module_count: 3
+    expected_route: delegation
+
+  # ── EDGE cases ────────────────────────────────────────────────────────────
+
+  - id: edge-01-sequential-overrides-type
+    description: delegation task_type but sequential dependency → must be single
+    task:
+      goal: "Migrate the schema and then update the models to use the new schema"
+      task_type: multi_file_refactor
+      risk: 3
+      complexity: 3
+      has_sequential_dependency: true
+      independent_subtask_count: 2
+      affected_module_count: 2
+      success_criteria:
+        - schema migration applied cleanly
+        - all models use new schema fields
+    expected_route: single
+
+  - id: edge-02-delegation-type-but-low-subtasks
+    description: multi_file_refactor type but only 1 subtask — type alone triggers
+    task:
+      goal: "Refactor the single Config class to use dataclasses"
+      task_type: multi_file_refactor
+      risk: 1
+      complexity: 2
+      has_sequential_dependency: false
+      independent_subtask_count: 1
+      affected_module_count: 1
+    expected_route: delegation
+    note: "task_type=multi_file_refactor is in allowed_task_types so triggers delegation
+           even with 1 subtask — by policy design"

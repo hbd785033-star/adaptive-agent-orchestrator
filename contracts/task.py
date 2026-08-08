@@ -1,13 +1,14 @@
 """Task Contract — the single source of truth passed to every agent."""
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any
-from pydantic import BaseModel, Field, model_validator
 import uuid
+from enum import IntEnum, StrEnum
+from typing import Any
+
+from pydantic import BaseModel, Field, model_validator
 
 
-class TaskType(str, Enum):
+class TaskType(StrEnum):
     CODE_FIX = "code_fix"
     MULTI_FILE_REFACTOR = "multi_file_refactor"
     PARALLEL_RESEARCH = "parallel_research"
@@ -16,7 +17,7 @@ class TaskType(str, Enum):
     GENERAL = "general"
 
 
-class RiskLevel(int, Enum):
+class RiskLevel(IntEnum):
     LOW = 1
     MEDIUM = 2
     HIGH = 3
@@ -64,7 +65,7 @@ class TaskContract(BaseModel):
     parent_task_id: str | None = None
 
     @model_validator(mode="after")
-    def validate_high_risk_has_criteria(self) -> "TaskContract":
+    def validate_high_risk_has_criteria(self) -> TaskContract:
         if self.risk >= RiskLevel.HIGH and not self.success_criteria:
             raise ValueError("High-risk tasks must define success_criteria")
         return self

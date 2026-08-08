@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import pytest
-from contracts.result import RunStatus
-from contracts.task import TaskContract, TaskType
+
 from adapters.mock import MockHermesAdapter
+from contracts.result import RunStatus
+from contracts.task import TaskContract
 
 
 def make_task(**kwargs) -> TaskContract:
@@ -95,8 +96,8 @@ class TestMockAdapter:
 class TestStateMachine:
     @pytest.mark.asyncio
     async def test_happy_path_transitions(self, tmp_path):
-        from storage.database import Database
         from orchestrator.state_machine import StateMachine, TaskStatus
+        from storage.database import Database
 
         db = Database(tmp_path / "test.db")
         await db.connect()
@@ -126,8 +127,8 @@ class TestStateMachine:
 
     @pytest.mark.asyncio
     async def test_illegal_transition_raises(self, tmp_path):
+        from orchestrator.state_machine import IllegalTransitionError, StateMachine, TaskStatus
         from storage.database import Database
-        from orchestrator.state_machine import StateMachine, TaskStatus, IllegalTransitionError
 
         db = Database(tmp_path / "test2.db")
         await db.connect()

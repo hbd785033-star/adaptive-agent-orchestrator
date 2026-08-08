@@ -13,16 +13,17 @@ Rules:
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import subprocess
-from enum import Enum
+from collections.abc import Iterator
+from enum import StrEnum
 from pathlib import Path
-from typing import Iterator
 
 import yaml
 
 
-class WorktreeStatus(str, Enum):
+class WorktreeStatus(StrEnum):
     ALLOCATED  = "allocated"
     ACTIVE     = "active"
     MERGING    = "merging"
@@ -110,10 +111,8 @@ class WorkspaceManager:
         """
         record = self._get(task_id, child_id)
         _git(self._repo, ["worktree", "remove", "--force", str(record.worktree_path)])
-        try:
+        with contextlib.suppress(RuntimeError):
             _git(self._repo, ["branch", "-D", record.branch])
-        except RuntimeError:
-            pass  # branch may already be deleted
         record.status = WorktreeStatus.CLEANED
 
     def list_records(self) -> Iterator[WorktreeRecord]:

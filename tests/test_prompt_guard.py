@@ -1,10 +1,6 @@
 """Tests for PromptGuard — constraint injection and delegation splitting."""
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
 from contracts.task import RiskLevel, TaskContract, TaskType, WorkspaceSpec
 from orchestrator.prompt_guard import inject_constraints, split_for_delegation
 

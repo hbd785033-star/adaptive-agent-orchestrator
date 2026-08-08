@@ -16,14 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-import subprocess
 from pathlib import Path
 
 from contracts.evaluation import EvalCheck, EvalResult, EvalStatus
 from contracts.result import AgentResult
 from contracts.task import TaskContract
 from orchestrator.budget import BudgetState
-
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
@@ -98,7 +96,7 @@ async def check_tests(repo_path: str | Path, changed_files: list[str]) -> EvalCh
             detail=output[-1000:],
             blocker=True,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return EvalCheck(name="tests", status=EvalStatus.FAIL, detail="test run timed out (120s)", blocker=True)
     except FileNotFoundError as e:
         return EvalCheck(name="tests", status=EvalStatus.SKIP, detail=f"runner not found: {e}", blocker=False)
@@ -122,7 +120,7 @@ async def check_lint(repo_path: str | Path, changed_files: list[str]) -> EvalChe
         if proc.returncode == 0:
             return EvalCheck(name="lint", status=EvalStatus.PASS, detail="ruff: no issues")
         return EvalCheck(name="lint", status=EvalStatus.FAIL, detail=output[-800:], blocker=False)  # lint=non-blocker in v1
-    except (asyncio.TimeoutError, FileNotFoundError) as e:
+    except (TimeoutError, FileNotFoundError) as e:
         return EvalCheck(name="lint", status=EvalStatus.SKIP, detail=f"ruff not available: {e}", blocker=False)
 
 

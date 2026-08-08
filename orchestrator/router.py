@@ -16,7 +16,7 @@ from typing import Literal
 
 import yaml
 
-from contracts.task import TaskContract, TaskType
+from contracts.task import TaskContract
 
 Route = Literal["single", "delegation"]
 
@@ -106,17 +106,15 @@ class RuleRouter:
             reasons.append("sequential_dependency=true → forces single")
             return RoutingDecision("single", reasons, self._policy_version)
 
-        if task.complexity <= self._max_complexity and affected_module_count <= self._max_affected_modules:
-            reasons.append(
-                f"complexity={task.complexity} <= {self._max_complexity}"
-                f" AND affected_modules={affected_module_count} <= {self._max_affected_modules}"
-                " → single"
-            )
-            return RoutingDecision("single", reasons, self._policy_version)
-
-        # ── Delegation triggers ───────────────────────────────────────────────
+        # ── Delegation triggers (before single complexity check) ──────────────
+        # task_type and subtask count are checked before complexity/module
+        # thresholds so that an explicit delegation task_type is not swallowed
+        # by a low-complexity single rule.
 
         delegation_signals: list[str] = []
+
+        if task.task_type.value in self._allowed_task_types:
+            delegation_signals.append(f"task_type={task.task_type.value} in allowed_task_types")
 
         if independent_subtask_count >= self._min_independent_subtasks:
             delegation_signals.append(
@@ -129,12 +127,19 @@ class RuleRouter:
                 f"estimated_input_tokens={estimated_tokens} >= {self._min_estimated_input_tokens}"
             )
 
-        if task.task_type.value in self._allowed_task_types:
-            delegation_signals.append(f"task_type={task.task_type.value} in allowed_task_types")
-
         if delegation_signals:
             reasons.extend(delegation_signals)
             return RoutingDecision("delegation", reasons, self._policy_version)
+
+        # ── Single complexity/module rule (fallback) ──────────────────────────
+
+        if task.complexity <= self._max_complexity and affected_module_count <= self._max_affected_modules:
+            reasons.append(
+                f"complexity={task.complexity} <= {self._max_complexity}"
+                f" AND affected_modules={affected_module_count} <= {self._max_affected_modules}"
+                " → single"
+            )
+            return RoutingDecision("single", reasons, self._policy_version)
 
         # ── Default ───────────────────────────────────────────────────────────
         reasons.append("no delegation triggers matched → default single")

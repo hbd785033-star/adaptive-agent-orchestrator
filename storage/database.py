@@ -10,7 +10,6 @@ import aiosqlite
 
 from storage.migrations.v1 import ALL_STATEMENTS, SCHEMA_VERSION
 
-
 _DEFAULT_DB = Path("data/orchestrator.db")
 
 

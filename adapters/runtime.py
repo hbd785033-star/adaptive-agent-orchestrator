@@ -6,9 +6,10 @@ adapters/hermes/ and adapters/mock.py.
 """
 from __future__ import annotations
 
-from typing import AsyncIterator, Protocol, runtime_checkable
+from collections.abc import AsyncIterator
+from typing import Protocol, runtime_checkable
 
-from contracts.result import AgentResult, AgentEvent, RunHandle, RunStatus, Usage
+from contracts.result import AgentEvent, AgentResult, RunHandle, RunStatus, Usage
 from contracts.task import TaskContract
 
 

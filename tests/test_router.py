@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import pytest
-from contracts.task import TaskContract, TaskType, RiskLevel
-from orchestrator.router import RuleRouter, RoutingDecision
+
+from contracts.task import TaskContract, TaskType
+from orchestrator.router import RuleRouter
 
 
 @pytest.fixture
