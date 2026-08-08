@@ -5,222 +5,189 @@ Control plane for Hermes-backed multi-agent workflows.
 ```
 用户任务
    ↓
-Task Contract (Pydantic)
+Task Contract (Pydantic)     ← 目标 / 约束 / 允许路径 / 成功标准
    ↓
-Task Profiler
+Task Profiler                ← token 估算 / 子任务数 / 模块数
    ↓
-Rule Router  ──  policies/default.yaml  ──  routing_decisions (append-only)
+Rule Router ── policies/default.yaml
+   ├─ single                 ← 单 Agent
+   └─ delegation             ← 两个并行子 Agent
    ↓
-Budget Gate + Approval Gate
+Budget Gate + Approval Gate  ← 硬限制 / 高风险人工确认
    ↓
-Workspace Manager  (git worktree per code-writing child)
+Prompt Guard                 ← 把约束编码进 Agent prompt
    ↓
-Hermes Runtime Adapter  (TUI Gateway WebSocket)
-   single │ delegation
+Workspace Manager            ← Git Worktree 隔离（写代码任务）
    ↓
-Event Stream  (AgentEvent — typed)
+Hermes Runtime Adapter       ← WebSocket TUI Gateway
    ↓
-Deterministic Eval Gate
-   paths · budget · secrets · lint · tests
+Deterministic Eval Gate      ← paths / budget / tests / secrets / lint
    ↓
-Telemetry + SQLite
-   operational: tasks / runs / subtasks
-   audit:       telemetry_events / eval_results / routing_decisions / usage_records
-   ↓
-COMPLETED  /  FAILED→RETRY→…  /  ABANDONED
+SQLite（状态 + Telemetry）   ← append-only 审计日志
 ```
 
 ---
 
-## Phase 0 first: validate Hermes Gateway
+## Quick Start
 
-Before running any real tasks, run the spike to confirm your Hermes instance
-exposes the TUI Gateway and all required operations work:
-
-```bash
-python spike/phase0_gateway.py --ws ws://localhost:PORT --task "say hello"
-```
-
-The spike checks: connect → auth → session → submit → event stream →
-delegation events → usage → steer → interrupt → reconnect → cleanup.
-
-It writes a YAML compatibility report.  **Do not start Phase 1 until all
-`blockers` pass.**
-
----
-
-## Quick start
+### 1. 安装
 
 ```bash
-# create venv and install
+git clone <repo>
+cd adaptive-agent-orchestrator
 uv venv .venv --python 3.11
 uv pip install -e ".[dev]"
+```
 
-# run all tests (no Hermes required — uses MockHermesAdapter)
-pytest tests/ -v
+### 2. 用 Mock Adapter 跑第一个任务（无需 Hermes 进程）
 
-# submit a task via CLI
-aao run \
-  --goal "refactor src/auth/login.py to use the new session helper" \
-  --allowed-paths "src/auth/**" \
-  --task-type general
+```bash
+aao run "Fix the null pointer in login handler" \
+    --mock \
+    --type code_fix \
+    --complexity 2 \
+    --allow "src/auth/**" \
+    --allow "tests/auth/**"
+```
+
+输出示例：
+```
+✅  Outcome: completed   Route: single   Retries: 0
+   Tokens: in=500 out=200 total=700
+   Eval: pass
+```
+
+### 3. 查看统计
+
+```bash
+aao stats
+```
+
+### 4. 路由回测（CI 里也会自动跑）
+
+```bash
+aao eval-routing
+# Results: 15/15 passed  Policy: routing-v1.0
+```
+
+### 5. 连接真实 Hermes（Phase 0 spike）
+
+先在本地启动 Hermes TUI Gateway，然后：
+
+```bash
+aao spike --url ws://localhost:4999
+# 输出兼容性报告到 spike/phase0_report.yaml
+```
+
+如果 Phase 0 通过，把 `--mock` 去掉即可接入真实 Hermes：
+
+```bash
+aao run "Refactor auth module" \
+    --type multi_file_refactor \
+    --complexity 4 \
+    --allow "src/auth/**" \
+    --hermes ws://localhost:4999
 ```
 
 ---
 
-## Project layout
+## 架构分层
+
+| 层 | 职责 | 关键文件 |
+|---|---|---|
+| 控制平面 | 路由、预算、状态机 | `orchestrator/` |
+| 合约层 | 任务结构验证 | `contracts/` |
+| 执行层 | Hermes Adapter / Mock | `adapters/` |
+| 评估层 | 确定性 Eval Gate | `evals/gate.py` |
+| 存储层 | SQLite（运行状态 + 审计） | `storage/` |
+| 遥测层 | append-only 事件日志 | `telemetry/` |
+
+## 目录结构
 
 ```
 adaptive-agent-orchestrator/
-│
-├─ cli/            typer CLI entry point
-├─ contracts/      TaskContract, AgentEvent, EvalResult — Pydantic models
-├─ adapters/
-│  ├─ runtime.py   AgentRuntime Protocol (swap Hermes for Codex later)
-│  ├─ hermes/      HermesAdapter — WebSocket TUI Gateway
-│  └─ mock.py      MockHermesAdapter — deterministic, no Hermes needed
-├─ orchestrator/
-│  ├─ engine.py    Main pipeline: profile→route→budget→execute→eval
-│  ├─ state_machine.py  TaskStatus + SQLite persistence
-│  ├─ router.py    RuleRouter — single / delegation, records policy_version
-│  ├─ profiler.py  Extracts routing signals from TaskContract
-│  ├─ budget.py    BudgetGate (hard limits) + ApprovalGate (CLI yes/no)
-│  └─ workspace.py WorkspaceManager — git worktree lifecycle
-├─ evals/
-│  └─ gate.py      DeterministicEvalGate: paths, budget, secrets, lint, tests
-├─ storage/        aiosqlite database — two conceptual groups (see below)
-├─ telemetry/      Append-only event log + routing metrics queries
-├─ policies/       default.yaml — routing rules + budget + approval triggers
-├─ spike/          phase0_gateway.py — Hermes Gateway compatibility test
-└─ tests/          46 unit + integration tests, all via MockHermesAdapter
+├── aao_cli/main.py          CLI: run / spike / history / eval-routing / stats
+├── aao_entry.py             console_script 入口
+├── adapters/
+│   ├── hermes/gateway.py    HermesAdapter (WebSocket + event stream + reconnect)
+│   ├── mock.py              MockHermesAdapter (无需 Hermes 进程，用于测试)
+│   └── runtime.py           AgentRuntime Protocol
+├── contracts/
+│   ├── task.py              TaskContract / TaskType / RiskLevel / WorkspaceSpec
+│   ├── result.py            RunHandle / RunStatus / AgentResult / Usage / AgentEvent
+│   └── evaluation.py        EvalResult / EvalCheck / EvalStatus
+├── orchestrator/
+│   ├── engine.py            完整执行流（profile → route → budget → workspace → eval）
+│   ├── state_machine.py     TaskStatus 状态机 + SQLite 持久化
+│   ├── router.py            Rule Router（single / delegation，记录 policy_version）
+│   ├── profiler.py          TaskProfiler（token 估算 / subtask 数 / 模块数）
+│   ├── budget.py            BudgetGate + ApprovalGate（CLI yes/no）
+│   ├── workspace.py         WorkspaceManager（git worktree 四状态生命周期）
+│   └── prompt_guard.py      PromptGuard（约束注入 + delegation splitting）
+├── evals/gate.py            DeterministicEvalGate（paths/budget/tests/secrets/lint）
+├── storage/
+│   ├── database.py          aiosqlite 异步层
+│   └── migrations/v1.py     operational + append-only audit 两组表
+├── telemetry/events.py      TelemetryRecorder（append-only）
+├── policies/default.yaml    路由规则（含 policy_version，可证伪）
+├── datasets/
+│   ├── routing_cases.yaml   路由回测用例（15 cases，aao eval-routing 使用）
+│   └── failure_cases.yaml   失败模式记录（6 条，含根因和修复建议）
+└── spike/phase0_gateway.py  Phase 0：Hermes Gateway 全生命周期验证脚本
+```
+
+## CLI 命令
+
+```bash
+aao run GOAL [OPTIONS]        # 提交任务
+aao spike                     # Phase 0 Hermes Gateway 兼容性检查
+aao history                   # 查看路由决策历史
+aao eval-routing              # 路由策略回测（CI gate）
+aao stats                     # 任务统计 / token 用量 / eval 通过率
+```
+
+## 运行测试
+
+```bash
+pytest tests/                 # 77 tests（含路由回归 15 cases）
+ruff check . --ignore E501,B008  # lint（应 0 errors）
 ```
 
 ---
 
-## Storage model
+## V1 / V2 / V3 路线图
 
-Two groups, separate access patterns:
-
-**Operational** (mutable, tracks live state)
-- `tasks` — current TaskStatus, retry count
-- `runs` — per-execution record
-- `subtasks` — child agent runs
-
-**Audit** (append-only, never modified after write)
-- `telemetry_events` — structured event log
-- `eval_results` — per-run eval gate output
-- `routing_decisions` — route + reasons + `policy_version` column (indexed)
-- `usage_records` — token + cost per run
-
-`policy_version` is a top-level SQL column so you can join and compare:
-
-```sql
-SELECT route, policy_version, COUNT(*) tasks,
-       ROUND(AVG(CASE WHEN e.overall = 'pass' THEN 1.0 ELSE 0.0 END), 3) success_rate
-FROM routing_decisions r
-JOIN eval_results e USING (task_id)
-GROUP BY policy_version, route
-ORDER BY policy_version, route;
-```
+| 功能 | V1 ✅ | V2 | V3 |
+|---|---|---|---|
+| Task Contract + Pydantic | ✅ | | |
+| Hermes Gateway Adapter | ✅ | | |
+| Single Agent | ✅ | | |
+| Delegation (2 子 Agent) | ✅ | | |
+| Rule Router + policy_version | ✅ | | |
+| Budget Gate | ✅ | | |
+| SQLite 状态持久化 | ✅ | | |
+| Telemetry（append-only） | ✅ | | |
+| Deterministic Eval Gate | ✅ | | |
+| Prompt Guard | ✅ | | |
+| Git Worktree 隔离 | ✅ | | |
+| 简单 CLI 人工确认 | ✅ | | |
+| Model Council 集成 | | ✅ | |
+| LLM Judge | | ✅ | |
+| 轨迹 Eval | | ✅ | |
+| 角色模型路由 | | ✅ | |
+| LangGraph 状态机 | | 视需要 | |
+| 学习型 Router | | | ✅ |
+| 自适应预算 | | | ✅ |
 
 ---
 
-## Routing policy
+## 核心设计原则
 
-Edit `policies/default.yaml` to tune routing rules.
-Increment `policy_version` on every change so `routing_decisions` can diff
-success rates across versions.
-
-```yaml
-policy_version: "routing-v1.0"
-
-routing:
-  delegation:
-    min_independent_subtasks: 2
-    min_estimated_input_tokens: 8000
-    allowed_task_types:
-      - multi_file_refactor
-      - parallel_research
-      - test_and_implement
-  single:
-    max_complexity: 2
-    max_affected_modules: 1
-  constraints:
-    sequential_dependency_forces_single: true
-```
-
----
-
-## Budget & approval
-
-`policies/default.yaml` also controls hard limits and approval triggers:
-
-```yaml
-budget:
-  max_children: 2
-  max_depth: 1
-  max_retries: 1
-  max_total_calls: 8
-  require_approval_above_calls: 5
-
-approval:
-  require_for_risk_levels: [high, critical]
-  require_for_actions: [delete, deploy, merge_main, send_to_multiple_providers]
-```
-
-Tasks that exceed `require_approval_above_calls` or touch a forbidden action
-pause and ask `Proceed? [y/N]` on the CLI before continuing.
-
----
-
-## Worktree isolation
-
-For any `delegation` task that writes code, the engine allocates one git
-worktree per child agent:
+> **先让单 Agent / 多 Agent 路由变得可测量、可追踪、可恢复，再加入更聪明的判断。**
 
 ```
-repo/
-└─ .worktrees/
-   └─ <task_id>/
-      ├─ child-1/   branch: agent/<task_id>/child-1
-      └─ child-2/   branch: agent/<task_id>/child-2
+控制平面 = 这个项目
+执行平面 = Hermes
+决策模块 = Model Council（V2 接入）
+验证模块 = Eval Gate
 ```
-
-Read-only / research delegation shares the main tree.
-
-Worktree states: `ALLOCATED → ACTIVE → MERGING → CLEANED`
-                                     `↘ ABANDONED`  (eval fail; kept for inspection)
-
----
-
-## Adding a runtime adapter
-
-1. Implement `adapters/runtime.py::AgentRuntime` (all async)
-2. Add `events(run_id, *, after=...)` — yields `AgentEvent`, supports cursor-based reconnect
-3. Wire it in `cli/main.py`
-
-The router, eval gate, budget, and telemetry layers are adapter-agnostic.
-
----
-
-## V1 / V2 / V3 roadmap
-
-| Feature | Status |
-|---|---|
-| Task Contract + Pydantic | ✅ v1 |
-| Hermes Gateway Adapter | ✅ v1 |
-| Mock Adapter + 46 tests | ✅ v1 |
-| Rule Router (single/delegation) | ✅ v1 |
-| Budget Gate + Approval Gate | ✅ v1 |
-| Git Worktree isolation | ✅ v1 |
-| Deterministic Eval Gate | ✅ v1 |
-| SQLite state + audit tables | ✅ v1 |
-| Telemetry + metrics queries | ✅ v1 |
-| Phase 0 Gateway spike | ✅ v1 |
-| Model Council integration | v2 |
-| LLM Judge | v2 |
-| Trajectory Eval | v2 |
-| Per-role model routing | v2 |
-| LangGraph (if needed) | v2 optional |
-| Learning Router | v3 |
-| Adaptive budget | v3 |

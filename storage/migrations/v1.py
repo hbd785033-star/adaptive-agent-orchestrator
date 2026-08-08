@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     input_tokens    INTEGER NOT NULL DEFAULT 0,
     output_tokens   INTEGER NOT NULL DEFAULT 0,
     total_tokens    INTEGER NOT NULL DEFAULT 0,
-    estimated_cost  REAL,
+    estimated_cost_usd  REAL,
     recorded_at     TEXT NOT NULL
 );
 """

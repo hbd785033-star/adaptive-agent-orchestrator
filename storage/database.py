@@ -128,14 +128,14 @@ class Database:
         )
         await self._db.commit()
 
-    async def append_usage(self, task_id: str, run_id: str, input_tokens: int, output_tokens: int, estimated_cost: float | None) -> None:
+    async def append_usage(self, task_id: str, run_id: str, input_tokens: int, output_tokens: int, estimated_cost_usd: float | None) -> None:
         assert self._db
         await self._db.execute(
             "INSERT INTO usage_records "
-            "(id, task_id, run_id, input_tokens, output_tokens, total_tokens, estimated_cost, recorded_at) "
+            "(id, task_id, run_id, input_tokens, output_tokens, total_tokens, estimated_cost_usd, recorded_at) "
             "VALUES (?,?,?,?,?,?,?,?)",
             (_uid(), task_id, run_id, input_tokens, output_tokens,
-             input_tokens + output_tokens, estimated_cost, _now()),
+             input_tokens + output_tokens, estimated_cost_usd, _now()),
         )
         await self._db.commit()
 

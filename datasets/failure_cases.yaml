@@ -1,21 +1,159 @@
 # Failure cases — real or synthetic task failures used to improve eval and routing.
 #
-# Each entry documents a task that failed, why it failed, and what the
-# correct routing or eval decision should have been.
-#
-# Use these to:
-#   1. Regression-test the router after policy changes
-#   2. Seed the LLM Judge training set (v2)
-#   3. Identify systematic failure patterns
+# Each entry documents a task that failed, the actual route taken, what went wrong,
+# and the proposed fix. Accumulate real failures here as the system runs.
 #
 # Fields:
-#   id             — unique slug
-#   date           — ISO date when failure was observed
-#   route_used     — what route was actually chosen
-#   correct_route  — what should have been chosen
-#   failure_mode   — one of: wrong_route, path_violation, budget_exceeded,
-#                    agent_hallucinated, eval_false_positive, eval_false_negative
-#   description    — what happened
-#   lesson         — what rule or threshold should change
+#   id              — unique slug
+#   description     — human note on what happened
+#   task            — TaskContract fields at time of failure
+#   route_taken     — what the router decided
+#   failure_mode    — one of: wrong_route | eval_fail_paths | eval_fail_budget |
+#                     agent_error | approval_denied | context_loss | worktree_conflict
+#   root_cause      — brief explanation
+#   proposed_fix    — what should change (policy / contract / eval / adapter)
+#   resolved        — true/false
 
-cases: []   # populate as real tasks accumulate
+cases:
+
+  - id: fail-01-single-context-loss
+    description: |
+      A single-agent task with a large context (>12k tokens of existing code pasted
+      into goal) caused the agent to ignore the forbidden_actions constraint and
+      write to an out-of-scope file.  Eval caught the path violation.
+    task:
+      goal: "Refactor the payment service to use the new retry library"
+      task_type: general
+      complexity: 3
+      risk: 2
+      allowed_paths:
+        - "src/payments/**"
+      forbidden_actions:
+        - "modify database migrations"
+    route_taken: single
+    failure_mode: eval_fail_paths
+    root_cause: |
+      Prompt guard block was at the end of a very long goal string; model
+      appeared to anchor on early instructions and disregard the constraint block.
+    proposed_fix: |
+      Move constraint block to the START of goal, before the task description.
+      Also reduce context size — summarise pasted code rather than including verbatim.
+    resolved: false
+
+  - id: fail-02-delegation-context-gap
+    description: |
+      A delegation task split auth-module refactor across two child agents.
+      Child-1 renamed a function; child-2 did not know about the rename and
+      introduced a call to the old function name.  Tests caught this.
+    task:
+      goal: "Refactor login and session modules to use shared token validator"
+      task_type: multi_file_refactor
+      complexity: 4
+      risk: 2
+      independent_subtask_count: 2
+      allowed_paths:
+        - "src/auth/**"
+        - "src/session/**"
+    route_taken: delegation
+    failure_mode: eval_fail_paths
+    root_cause: |
+      The two child agents had no shared context about each other's changes.
+      split_for_delegation injects each child's goal into the other's context
+      as a string, but that text is not machine-readable enough for the agent to
+      detect the naming conflict.
+    proposed_fix: |
+      After child worktrees complete and before eval, generate a shared diff
+      summary and inject it into a final "integration check" prompt.
+      This is a v2 feature (integration eval step).
+    resolved: false
+
+  - id: fail-03-wrong-route-research
+    description: |
+      A parallel research task (two independent literature searches) was routed
+      to single because the profiler did not detect parallel keywords in a
+      technically-phrased goal with no obvious "and"/"also"/"separately" signals.
+    task:
+      goal: "Investigate token efficiency of Flash-2 vs Sonnet-4 for summarisation benchmarks"
+      task_type: parallel_research
+      complexity: 2
+      risk: 1
+    route_taken: single
+    failure_mode: wrong_route
+    root_cause: |
+      task_type=parallel_research should always trigger delegation, but the
+      single rule (complexity<=2 AND modules<=1) ran first and returned early.
+      This was fixed in routing-v1.0 by checking task_type BEFORE the single
+      complexity gate.  Keeping this case for regression reference.
+    proposed_fix: |
+      Already fixed in routing-v1.0.  Router now checks allowed_task_types
+      before the single complexity/module gate.
+    resolved: true
+
+  - id: fail-04-budget-exceeded-mid-run
+    description: |
+      A delegation task with max_children=2 but the agent triggered three
+      internal sub-calls.  Budget gate caught the excess on the third call
+      and abandoned the task.
+    task:
+      goal: "Add integration tests for all three payment adapters"
+      task_type: test_and_implement
+      complexity: 3
+      risk: 2
+      independent_subtask_count: 3
+      success_criteria:
+        - "pytest tests/payments/ passes"
+    route_taken: delegation
+    failure_mode: eval_fail_budget
+    root_cause: |
+      Task had 3 independent subtasks but budget was capped at max_children=2.
+      The third subtask could not be executed.
+    proposed_fix: |
+      Profiler should detect subtask_count > max_children and either:
+      (a) surface a warning and ask user to raise budget, or
+      (b) merge the smallest subtasks into one.
+      Add a pre-flight check in engine._execute before workspace allocation.
+    resolved: false
+
+  - id: fail-05-worktree-stale-branch
+    description: |
+      After a failed delegation run, the worktree branches were left in ABANDONED
+      state.  On the next run of the same task_id (manual retry without cleanup),
+      git worktree add failed because the branch name already existed.
+    task:
+      goal: "Migrate config loading to use pydantic-settings"
+      task_type: multi_file_refactor
+      complexity: 3
+      risk: 2
+    route_taken: delegation
+    failure_mode: agent_error
+    root_cause: |
+      WorkspaceManager.allocate() uses deterministic branch names based on
+      task_id and child_id.  On retry with the same task_id, git refuses to
+      create a branch that already exists.
+    proposed_fix: |
+      Before allocate(), check if the branch exists and if its worktree status
+      is ABANDONED.  If so, run `git branch -D <branch>` and `git worktree prune`
+      before re-creating.  Add WorkspaceManager.cleanup_abandoned(task_id).
+    resolved: false
+
+  - id: fail-06-approval-gate-timeout
+    description: |
+      A HIGH risk task waited for CLI approval for 5 minutes with no response
+      (user stepped away).  The process hung indefinitely.
+    task:
+      goal: "Deploy updated payment service to staging"
+      task_type: general
+      complexity: 2
+      risk: 3
+      success_criteria:
+        - "staging health check returns 200"
+    route_taken: single
+    failure_mode: approval_denied
+    root_cause: |
+      ApprovalGate.prompt_user() uses input() which blocks forever.
+      No timeout is configured.
+    proposed_fix: |
+      Add a configurable timeout (default 120s) to ApprovalGate.prompt_user().
+      On timeout, default to DENY and log a warning.
+      v2: replace with async approval via Hermes clarify.respond endpoint.
+    resolved: false
