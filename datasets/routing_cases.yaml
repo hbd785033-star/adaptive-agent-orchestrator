@@ -1,0 +1,69 @@
+# Routing test cases — used to evaluate and compare routing policy versions.
+#
+# Each entry is a labelled example: given the task attributes, what route
+# should the router choose?  Run `aao eval-routing` to score the current
+# policy against these cases.
+#
+# Fields:
+#   id          — unique slug
+#   description — human note
+#   task        — subset of TaskContract fields used by the profiler/router
+#   expected    — "single" or "delegation"
+
+cases:
+
+  - id: simple_bug_fix
+    description: Single-file auth bug, low complexity
+    task:
+      task_type: general
+      goal: "Fix NoneType error in src/auth/login.py"
+      complexity: 1
+      independent_subtask_count: 1
+      has_sequential_dependency: false
+      affected_module_count: 1
+    expected: single
+
+  - id: multi_module_refactor
+    description: Auth + payments refactor, two independent modules
+    task:
+      task_type: multi_file_refactor
+      goal: "Refactor auth and payments to use new session helper"
+      complexity: 3
+      independent_subtask_count: 2
+      has_sequential_dependency: false
+      affected_module_count: 2
+    expected: delegation
+
+  - id: large_research_task
+    description: Large context research, estimated tokens above threshold
+    task:
+      task_type: parallel_research
+      goal: "Survey all third-party API integrations and produce a risk matrix"
+      complexity: 4
+      independent_subtask_count: 1
+      has_sequential_dependency: false
+      affected_module_count: 1
+      estimated_input_tokens: 12000
+    expected: delegation
+
+  - id: sequential_dependency
+    description: Step B depends on step A output — must stay single
+    task:
+      task_type: general
+      goal: "Migrate DB schema then update all models to match"
+      complexity: 3
+      independent_subtask_count: 2
+      has_sequential_dependency: true
+      affected_module_count: 3
+    expected: single
+
+  - id: small_test_and_implement
+    description: Write tests + implement for one small feature
+    task:
+      task_type: test_and_implement
+      goal: "Add rate-limiting to /api/login and cover with tests"
+      complexity: 2
+      independent_subtask_count: 2
+      has_sequential_dependency: false
+      affected_module_count: 1
+    expected: delegation

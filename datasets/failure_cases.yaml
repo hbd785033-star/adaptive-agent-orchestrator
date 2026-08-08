@@ -1,0 +1,21 @@
+# Failure cases — real or synthetic task failures used to improve eval and routing.
+#
+# Each entry documents a task that failed, why it failed, and what the
+# correct routing or eval decision should have been.
+#
+# Use these to:
+#   1. Regression-test the router after policy changes
+#   2. Seed the LLM Judge training set (v2)
+#   3. Identify systematic failure patterns
+#
+# Fields:
+#   id             — unique slug
+#   date           — ISO date when failure was observed
+#   route_used     — what route was actually chosen
+#   correct_route  — what should have been chosen
+#   failure_mode   — one of: wrong_route, path_violation, budget_exceeded,
+#                    agent_hallucinated, eval_false_positive, eval_false_negative
+#   description    — what happened
+#   lesson         — what rule or threshold should change
+
+cases: []   # populate as real tasks accumulate
