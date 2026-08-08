@@ -1,0 +1,259 @@
+"""
+End-to-end orchestrator integration test using MockHermesAdapter.
+
+Exercises the full pipeline:
+  TaskContract → Profiler → Router → Budget → Execution → EvalGate → Telemetry → DB
+without requiring a live Hermes instance.
+"""
+from __future__ import annotations
+
+import pytest
+from pathlib import Path
+
+from adapters.mock import MockHermesAdapter
+from contracts.task import TaskContract, TaskType, RiskLevel
+from orchestrator.engine import Orchestrator
+
+
+async def build_orch(tmp_path: Path, runtime) -> Orchestrator:
+    """Helper: build Orchestrator pointed at a temp DB and tmp policy."""
+    policy = tmp_path / "default.yaml"
+    policy.write_text(
+        """
+policy_version: "routing-v1.0"
+routing:
+  delegation:
+    min_independent_subtasks: 2
+    min_estimated_input_tokens: 8000
+    allowed_task_types:
+      - multi_file_refactor
+      - parallel_research
+      - test_and_implement
+  single:
+    max_complexity: 2
+    max_affected_modules: 1
+  constraints:
+    sequential_dependency_forces_single: true
+budget:
+  max_children: 2
+  max_depth: 1
+  max_retries: 1
+  max_total_calls: 8
+  require_approval_above_calls: 5
+approval:
+  always_require:
+    - delete_files
+    - deploy
+  require_for_risk_levels:
+    - 3
+    - 4
+worktree:
+  base_path: ".worktrees"
+  readonly_task_types:
+    - parallel_research
+    - code_review
+"""
+    )
+    return await Orchestrator.build(
+        runtime=runtime,
+        db_path=str(tmp_path / "test.db"),
+        repo_path=str(tmp_path),
+        policy_path=str(policy),
+    )
+
+
+class TestOrchestratorHappyPath:
+    @pytest.mark.asyncio
+    async def test_simple_task_completes(self, tmp_path):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("pass", files_changed=["src/auth/login.py"], summary="fixed login")
+
+        async with await build_orch(tmp_path, adapter) as orch:
+            task = TaskContract(
+                goal="fix the login timeout bug",
+                task_type=TaskType.CODE_FIX,
+                complexity=1,
+                allowed_paths=["src/auth/**"],
+            )
+            result = await orch.run(task)
+
+        assert result["outcome"] == "completed"
+        assert result["route"] == "single"
+        assert result["retry_count"] == 0
+        assert result["eval"]["overall"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_multi_file_task_routes_delegation(self, tmp_path):
+        # Need a real git repo so WorkspaceManager can create worktrees
+        import subprocess
+        subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "init"],
+                       check=True, capture_output=True,
+                       env={**__import__("os").environ,
+                            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t.com",
+                            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t.com"})
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario(
+            "pass",
+            files_changed=["src/auth/login.py", "src/payments/charge.py"],
+            summary="refactored both modules",
+        )
+
+        async with await build_orch(tmp_path, adapter) as orch:
+            task = TaskContract(
+                goal="refactor auth and payments independently",
+                task_type=TaskType.MULTI_FILE_REFACTOR,
+                complexity=4,
+                allowed_paths=["src/auth/**", "src/payments/**"],
+            )
+            result = await orch.run(task)
+
+        assert result["outcome"] == "completed"
+        assert result["route"] == "delegation"
+
+    @pytest.mark.asyncio
+    async def test_token_usage_recorded(self, tmp_path):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("pass", input_tokens=2000, output_tokens=800)
+
+        async with await build_orch(tmp_path, adapter) as orch:
+            task = TaskContract(goal="summarise the codebase", complexity=1)
+            result = await orch.run(task)
+
+        assert result["usage"]["input_tokens"] == 2000
+        assert result["usage"]["output_tokens"] == 800
+        assert result["usage"]["total_tokens"] == 2800
+
+    @pytest.mark.asyncio
+    async def test_path_violation_fails_eval(self, tmp_path):
+        """Agent writes outside allowed_paths → eval FAIL → retry → fail again."""
+        adapter = MockHermesAdapter()
+        # Both submit attempts return a path violation
+        adapter.enqueue_scenario("pass", files_changed=["src/payments/charge.py"])  # 1st attempt
+        adapter.enqueue_scenario("pass", files_changed=["src/payments/charge.py"])  # retry
+
+        async with await build_orch(tmp_path, adapter) as orch:
+            task = TaskContract(
+                goal="fix auth only",
+                complexity=1,
+                allowed_paths=["src/auth/**"],
+            )
+            result = await orch.run(task)
+
+        # eval fails (path violation) → retry → fails again → abandoned
+        assert result["outcome"] == "failed"
+        assert result["eval"]["overall"] == "fail"
+        assert "paths" in result["eval"]["failed_checks"]
+
+    @pytest.mark.asyncio
+    async def test_retry_succeeds_on_second_attempt(self, tmp_path):
+        adapter = MockHermesAdapter()
+        # First attempt: path violation
+        adapter.enqueue_scenario("pass", files_changed=["src/payments/charge.py"])
+        # Retry: correct paths
+        adapter.enqueue_scenario("pass", files_changed=["src/auth/login.py"])
+
+        async with await build_orch(tmp_path, adapter) as orch:
+            task = TaskContract(
+                goal="fix auth login",
+                complexity=1,
+                allowed_paths=["src/auth/**"],
+            )
+            result = await orch.run(task)
+
+        assert result["outcome"] == "completed"
+        assert result["retry_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_agent_failure_propagates(self, tmp_path):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("fail", error_message="tool crashed")
+        adapter.enqueue_scenario("fail", error_message="tool crashed again")  # retry also fails
+
+        async with await build_orch(tmp_path, adapter) as orch:
+            task = TaskContract(goal="do something risky", complexity=1)
+            result = await orch.run(task)
+
+        assert result["outcome"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_sequential_dep_forces_single(self, tmp_path):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("pass")
+
+        async with await build_orch(tmp_path, adapter) as orch:
+            # "then" keyword → sequential dependency → forced single
+            task = TaskContract(
+                goal="first fix the bug then deploy to staging",
+                task_type=TaskType.MULTI_FILE_REFACTOR,
+                complexity=4,
+                allowed_paths=["src/**"],
+            )
+            result = await orch.run(task)
+
+        assert result["route"] == "single"
+
+    @pytest.mark.asyncio
+    async def test_telemetry_written_to_db(self, tmp_path):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("pass")
+
+        orch = await build_orch(tmp_path, adapter)
+        task = TaskContract(goal="fix the bug", complexity=1)
+        await orch.run(task)
+
+        # Verify routing_decisions table was written
+        rows = await orch._db.get_routing_history()
+        assert len(rows) >= 1
+        row = rows[0]
+        assert row["task_id"] == task.id
+        assert row["route"] in ("single", "delegation")
+        assert row["policy_version"] == "routing-v1.0"
+
+        await orch.close()
+
+    @pytest.mark.asyncio
+    async def test_budget_exceeded_abandons_task(self, tmp_path):
+        """If calls_used already exceeds max at check time, task is abandoned."""
+        adapter = MockHermesAdapter()
+        # Not even consumed — budget check fires before submit
+
+        policy = tmp_path / "tight.yaml"
+        policy.write_text(
+            """
+policy_version: "routing-v1.0"
+routing:
+  delegation:
+    min_independent_subtasks: 2
+    min_estimated_input_tokens: 8000
+    allowed_task_types: []
+  single:
+    max_complexity: 5
+    max_affected_modules: 10
+  constraints:
+    sequential_dependency_forces_single: false
+budget:
+  max_children: 2
+  max_depth: 1
+  max_retries: 1
+  max_total_calls: 0   # zero budget → immediate block
+  require_approval_above_calls: 1
+approval:
+  always_require: []
+  require_for_risk_levels: [4]
+worktree:
+  base_path: ".worktrees"
+  readonly_task_types: []
+"""
+        )
+        orch = await Orchestrator.build(
+            runtime=adapter,
+            db_path=str(tmp_path / "budget_test.db"),
+            repo_path=str(tmp_path),
+            policy_path=str(policy),
+        )
+        task = TaskContract(goal="expensive task", complexity=3)
+        result = await orch.run(task)
+        await orch.close()
+
+        assert result["outcome"] == "abandoned"

@@ -1,0 +1,57 @@
+# Routing policy — v1.0
+# Router reads this at startup. Increment policy_version when rules change
+# so routing_decisions table can diff success rates across versions.
+
+policy_version: "routing-v1.0"
+
+routing:
+  delegation:
+    # Task must contain at least this many independently parallelisable subtasks
+    min_independent_subtasks: 2
+    # Estimated input tokens above this threshold favour delegation
+    # (heuristic: large prompts + multi-file = more likely to benefit from split)
+    min_estimated_input_tokens: 8000
+    # Task types that are structurally parallelisable
+    allowed_task_types:
+      - multi_file_refactor
+      - parallel_research
+      - test_and_implement
+
+  single:
+    # Complexity ≤ this → prefer single even if token estimate is high
+    max_complexity: 2
+    # Only one module affected → no benefit in splitting
+    max_affected_modules: 1
+
+  constraints:
+    # Sequential dependency between subtasks forces single regardless of other signals
+    sequential_dependency_forces_single: true
+
+budget:
+  # Hard limits — Budget Gate will BLOCK if exceeded
+  max_children: 2
+  max_depth: 1
+  max_retries: 1
+  max_total_calls: 8
+  # Tasks above this call estimate trigger human approval prompt
+  require_approval_above_calls: 5
+
+approval:
+  # Actions that always require human confirmation before execution
+  always_require:
+    - delete_files
+    - deploy
+    - push_to_main
+    - drop_database
+    - send_to_multiple_providers
+  # Risk levels that trigger approval gate
+  require_for_risk_levels:
+    - 3   # HIGH
+    - 4   # CRITICAL
+
+worktree:
+  base_path: ".worktrees"
+  # Read-only task types that do NOT need an isolated worktree
+  readonly_task_types:
+    - parallel_research
+    - code_review
