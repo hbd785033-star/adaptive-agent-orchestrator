@@ -40,6 +40,9 @@ aao = "aao_entry:app"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning",
+]
 
 [tool.ruff]
 target-version = "py311"

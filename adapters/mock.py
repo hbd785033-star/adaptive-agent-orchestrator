@@ -21,6 +21,7 @@ from contracts.result import (
     Usage,
 )
 from contracts.task import TaskContract
+from orchestrator.cost import estimate_cost
 
 
 class MockHermesAdapter:
@@ -85,6 +86,11 @@ class MockHermesAdapter:
                 input_tokens=state.scenario.get("input_tokens", 0),
                 output_tokens=state.scenario.get("output_tokens", 0),
                 total_tokens=state.scenario.get("input_tokens", 0) + state.scenario.get("output_tokens", 0),
+                estimated_cost_usd=estimate_cost(
+                    state.scenario.get("model", "claude-sonnet-4"),
+                    state.scenario.get("input_tokens", 0),
+                    state.scenario.get("output_tokens", 0),
+                ),
             ),
             files_changed=state.scenario.get("files_changed", []),
             summary=state.scenario.get("summary", ""),

@@ -171,7 +171,22 @@ class Orchestrator:
                 await record.mark_abandoned("user declined approval")
                 return self._summary(record, "abandoned", "declined by user")
 
-        # 4. Workspace allocation (write tasks only)
+        # 4. Pre-flight: subtask count vs budget
+        if (decision.route == "delegation"
+                and profile.independent_subtask_count > budget.config.max_children):
+            log.warning(
+                "subtask_count_exceeds_budget",
+                task_id=task.id,
+                subtask_count=profile.independent_subtask_count,
+                max_children=budget.config.max_children,
+            )
+            # Warn but don't abort — clamp to max_children, record in telemetry
+            await self._tel.record(task.id, "subtask_clamped", {
+                "requested": profile.independent_subtask_count,
+                "clamped_to": budget.config.max_children,
+            })
+
+        # 5. Workspace allocation (write tasks only)
         worktrees: list[tuple[str, Path]] = []  # [(child_id, path)]
         if self._wm and self._wm.needs_worktree(task.task_type.value) and decision.route == "delegation":
                 for i in range(budget.config.max_children):
@@ -181,7 +196,7 @@ class Orchestrator:
                     log.info("worktree_allocated", task_id=task.id, child_id=child_id,
                              worktree_path=str(wt.worktree_path))
 
-        # 5. Apply Prompt Guard — encode constraints into goal before submission
+        # 6. Apply Prompt Guard — encode constraints into goal before submission
         if decision.route == "delegation" and worktrees:
             # For delegation: submit one augmented task per child
             # (the runtime is responsible for fanning out; we produce the primary
@@ -194,7 +209,7 @@ class Orchestrator:
         else:
             guarded_task = inject_constraints(task)
 
-        # 6. Submit + stream events
+        # 7. Submit + stream events
         handle = await self._runtime.submit(guarded_task)
         await record.mark_running(handle.run_id)
         budget.calls_used += 1
@@ -219,7 +234,7 @@ class Orchestrator:
             elif event.type in ("completed", "error"):
                 break
 
-        # 6. Get final result
+        # 8. Get final result
         agent_result = await self._runtime.result(handle.run_id)
 
         # If agent itself failed (error event), skip eval and mark failed
@@ -232,7 +247,7 @@ class Orchestrator:
             usage.input_tokens, usage.output_tokens, usage.estimated_cost_usd
         )
 
-        # 7. Eval gate
+        # 9. Eval gate
         await record.mark_evaluating()
         eval_result = await self._eval_gate.run(task, agent_result, budget)
         await self._db.append_eval_result(
@@ -244,7 +259,7 @@ class Orchestrator:
             "failed_checks": [c.name for c in eval_result.failed_checks()],
         }, handle.run_id)
 
-        # 8. Outcome
+        # 10. Outcome
         if eval_result.overall == EvalStatus.PASS:
             await record.mark_completed()
             if self._wm:

@@ -70,9 +70,24 @@ class WorkspaceManager:
 
     def allocate(self, task_id: str, child_id: str) -> WorktreeRecord:
         """
-        Create the branch and worktree directory.
-        Returns a WorktreeRecord whose paths can be injected into TaskContract.workspace.
+        Create a new isolated worktree + branch for a writing child agent.
+        If a stale ABANDONED record for the same (task_id, child_id) exists,
+        cleans it up first so retries don't fail on duplicate branch names.
         """
+        key = (task_id, child_id)
+        if key in self._records:
+            existing = self._records[key]
+            if existing.status == WorktreeStatus.ABANDONED:
+                # Stale from a previous failed run — clean up before re-creating
+                _git(self._repo, ["worktree", "remove", "--force", str(existing.worktree_path)])
+                with contextlib.suppress(RuntimeError):
+                    _git(self._repo, ["branch", "-D", existing.branch])
+                del self._records[key]
+            else:
+                raise ValueError(
+                    f"Worktree for {task_id}/{child_id} already exists "
+                    f"with status={existing.status}"
+                )
         worktree_path = self._base / task_id / child_id
         branch = f"agent/{task_id}/{child_id}"
 

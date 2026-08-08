@@ -98,13 +98,33 @@ class ApprovalGate:
 
         return False, ""
 
-    def prompt_user(self, reason: str, task: TaskContract) -> bool:
+    def prompt_user(self, reason: str, task: TaskContract, timeout_s: int = 120) -> bool:
         """
-        Blocking CLI prompt. Returns True if user approves.
-        In non-interactive contexts (CI, tests) this should be bypassed
-        by injecting an ApprovalGate subclass.
+        Blocking CLI prompt with timeout. Returns True if user approves.
+        Defaults to DENY on timeout — never hangs a pipeline indefinitely.
+        In non-interactive contexts (CI, tests) inject an ApprovalGate subclass.
         """
+        import threading
+
         print(f"\n⚠️  Approval required: {reason}")
         print(f"   Task: {task.goal[:80]}")
-        answer = input("   Proceed? [y/N] ").strip().lower()
-        return answer in ("y", "yes")
+        print(f"   Proceed? [y/N]  (auto-DENY in {timeout_s}s) ", end="", flush=True)
+
+        answer: list[str] = []
+        answered = threading.Event()
+
+        def _read() -> None:
+            try:
+                answer.append(input())
+                answered.set()
+            except EOFError:
+                answered.set()  # non-interactive / pipe → treat as no
+
+        t = threading.Thread(target=_read, daemon=True)
+        t.start()
+        if not answered.wait(timeout_s):
+            print("\n   [timeout — auto-denied]")
+            return False
+
+        # answer is empty when stdin was closed (EOF) before any input was read
+        return bool(answer) and answer[0].strip().lower() in ("y", "yes")
