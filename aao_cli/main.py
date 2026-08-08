@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -223,6 +225,76 @@ async def _eval_routing(dataset_path: str, policy_path: str) -> None:
     )
     if failed > 0:
         raise SystemExit(1)
+
+
+@app.command()
+def stats(
+    db_path: str = typer.Option("data/orchestrator.db", "--db", help="Database path"),
+    policy_version: str | None = typer.Option(None, "--policy-version", "-p", help="Filter by policy version"),
+) -> None:
+    """Show task outcome and routing statistics from telemetry."""
+    if not Path(db_path).exists():
+        console.print(f"[yellow]No database found at {db_path}. Run a task first.[/yellow]")
+        return
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+
+    # Routing breakdown
+    if policy_version:
+        routing_rows = con.execute(
+            "SELECT route, policy_version, COUNT(*) as n FROM routing_decisions"
+            " WHERE policy_version = ? GROUP BY policy_version, route ORDER BY route",
+            (policy_version,),
+        ).fetchall()
+    else:
+        routing_rows = con.execute(
+            "SELECT route, policy_version, COUNT(*) as n FROM routing_decisions"
+            " GROUP BY policy_version, route ORDER BY policy_version, route"
+        ).fetchall()
+
+    if routing_rows:
+        rt = Table("policy_version", "route", "count", title="Routing Decisions")
+        for r in routing_rows:
+            rt.add_row(r["policy_version"], r["route"], str(r["n"]))
+        console.print(rt)
+    else:
+        console.print("[dim]No routing decisions recorded yet.[/dim]")
+
+    # Task outcomes
+    outcomes = con.execute(
+        "SELECT status, COUNT(*) as n FROM tasks GROUP BY status ORDER BY n DESC"
+    ).fetchall()
+    if outcomes:
+        ot = Table("status", "count", title="Task Outcomes")
+        for r in outcomes:
+            ot.add_row(r["status"], str(r["n"]))
+        console.print(ot)
+
+    # Token usage
+    usage = con.execute(
+        "SELECT COUNT(*) as runs, SUM(input_tokens) as inp, SUM(output_tokens) as out,"
+        " SUM(estimated_cost_usd) as cost FROM usage_records"
+    ).fetchone()
+    if usage and usage["runs"]:
+        console.print(
+            f"\nToken usage across {usage['runs']} run(s): "
+            f"in={usage['inp'] or 0:,}  out={usage['out'] or 0:,}  "
+            f"est_cost=${usage['cost'] or 0:.4f}"
+        )
+
+    # Eval pass rate
+    evals = con.execute(
+        "SELECT overall, COUNT(*) as n FROM eval_results GROUP BY overall"
+    ).fetchall()
+    if evals:
+        total_evals = sum(r["n"] for r in evals)
+        passed_n = next((r["n"] for r in evals if r["overall"] == "pass"), 0)
+        pct = 100 * passed_n // total_evals if total_evals else 0
+        color = "green" if pct >= 80 else "yellow" if pct >= 50 else "red"
+        console.print(f"Eval pass rate: [{color}]{passed_n}/{total_evals} ({pct}%)[/{color}]")
+
+    con.close()
 
 
 if __name__ == "__main__":

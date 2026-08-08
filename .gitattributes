@@ -1,0 +1,9 @@
+# Normalize line endings: repository stores LF, Windows checkout gets CRLF
+* text=auto eol=lf
+
+# Force binary for compiled artifacts
+*.exe binary
+*.pyc binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
