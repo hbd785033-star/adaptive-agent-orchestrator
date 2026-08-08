@@ -3,6 +3,8 @@ MockHermesAdapter — deterministic fake runtime for unit tests.
 
 Behaviour is driven by a scenario dict so tests can specify
 what events the adapter should emit without a live Hermes process.
+
+API matches adapters/runtime.py AgentRuntime Protocol (RunHandle-based).
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any
 
+from adapters.runtime import RuntimeCapabilities
 from contracts.result import (
     AgentEvent,
     AgentResult,
@@ -24,15 +27,23 @@ from contracts.task import TaskContract
 from orchestrator.cost import estimate_cost
 
 
+class _RunState:
+    def __init__(self, task_id: str, scenario: dict[str, Any]) -> None:
+        self.task_id = task_id
+        self.scenario = scenario
+        self.status = RunStatus.PENDING
+        self._events_exhausted = False
+
+
 class MockHermesAdapter:
     """
-    Usage in tests:
+    Usage in tests::
 
         adapter = MockHermesAdapter()
         adapter.enqueue_scenario("pass", files_changed=["src/foo.py"])
 
         handle = await adapter.submit(task)
-        result = await adapter.result(handle.run_id)
+        result = await adapter.wait(handle)
         assert result.status == RunStatus.COMPLETED
     """
 
@@ -48,6 +59,7 @@ class MockHermesAdapter:
         error_message: str | None = None,
         input_tokens: int = 500,
         output_tokens: int = 200,
+        model: str = "claude-sonnet-4",
         extra_events: list[dict] | None = None,
     ) -> None:
         self._scenario_queue.append(
@@ -58,11 +70,22 @@ class MockHermesAdapter:
                 error_message=error_message,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                model=model,
                 extra_events=extra_events or [],
             )
         )
 
-    # ── AgentRuntime protocol ────────────────────────────────────────────────
+    # ── AgentRuntime protocol (RunHandle-based) ───────────────────────────────
+
+    async def capabilities(self) -> RuntimeCapabilities:
+        return RuntimeCapabilities(
+            streaming_events=True,
+            mid_run_steer=False,
+            native_delegation=False,
+            cancellation=True,
+            session_resume=False,
+            max_concurrent_runs=8,
+        )
 
     async def submit(self, task: TaskContract) -> RunHandle:
         scenario = self._scenario_queue.pop(0) if self._scenario_queue else {}
@@ -70,61 +93,47 @@ class MockHermesAdapter:
         self._runs[run_id] = _RunState(task_id=task.id, scenario=scenario)
         return RunHandle(run_id=run_id, task_id=task.id)
 
-    async def status(self, run_id: str) -> RunStatus:
-        return self._runs[run_id].status
-
-    async def result(self, run_id: str) -> AgentResult:
-        state = self._runs[run_id]
-        # Drain the event iterator to drive state transitions
-        async for _ in self.events(run_id):
+    async def wait(self, handle: RunHandle) -> AgentResult:
+        """Block until run is terminal (drain events), return final result."""
+        state = self._runs[handle.run_id]
+        # Drain event iterator to drive state transitions
+        async for _ in self.events(handle):
             pass
-        return AgentResult(
-            run_id=run_id,
-            task_id=state.task_id,
-            status=state.status,
-            usage=Usage(
-                input_tokens=state.scenario.get("input_tokens", 0),
-                output_tokens=state.scenario.get("output_tokens", 0),
-                total_tokens=state.scenario.get("input_tokens", 0) + state.scenario.get("output_tokens", 0),
-                estimated_cost_usd=estimate_cost(
-                    state.scenario.get("model", "claude-sonnet-4"),
-                    state.scenario.get("input_tokens", 0),
-                    state.scenario.get("output_tokens", 0),
-                ),
-            ),
-            files_changed=state.scenario.get("files_changed", []),
-            summary=state.scenario.get("summary", ""),
-            error=state.scenario.get("error_message"),
-        )
+        return self._build_result(handle.run_id, state)
 
-    async def usage(self, run_id: str) -> Usage:
-        s = self._runs[run_id].scenario
+    async def usage(self, handle: RunHandle) -> Usage:
+        s = self._runs[handle.run_id].scenario
         return Usage(
             input_tokens=s.get("input_tokens", 0),
             output_tokens=s.get("output_tokens", 0),
             total_tokens=s.get("input_tokens", 0) + s.get("output_tokens", 0),
+            estimated_cost_usd=estimate_cost(
+                s.get("model", "claude-sonnet-4"),
+                s.get("input_tokens", 0),
+                s.get("output_tokens", 0),
+            ),
         )
 
-    async def cancel(self, run_id: str) -> None:
-        self._runs[run_id].status = RunStatus.CANCELLED
+    async def cancel(self, handle: RunHandle) -> None:
+        self._runs[handle.run_id].status = RunStatus.CANCELLED
 
-    async def steer(self, run_id: str, text: str) -> None:
+    async def steer(self, handle: RunHandle, instruction: str) -> None:
         # No-op in mock; tests can inspect steering calls via subclass
         pass
 
     async def events(
         self,
-        run_id: str,
+        handle: RunHandle,
         *,
         after: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        state = self._runs[run_id]
+        state = self._runs[handle.run_id]
         scenario = state.scenario
 
         def _evt(type_: str, payload: dict) -> AgentEvent:
             return AgentEvent(
                 id=uuid.uuid4().hex,
-                run_id=run_id,
+                run_id=handle.run_id,
                 timestamp=datetime.utcnow(),
                 type=type_,
                 payload=payload,
@@ -142,21 +151,11 @@ class MockHermesAdapter:
         if outcome == "approval_required":
             state.status = RunStatus.APPROVAL_REQUIRED
             yield _evt("approval_request", {"reason": "mock approval required"})
-            return
 
-        if outcome == "fail":
-            state.status = RunStatus.FAILED
-            yield _evt(
-                "error",
-                {
-                    "code": "mock_error",
-                    "message": scenario.get("error_message", "Mock failure"),
-                    "recoverable": False,
-                },
-            )
-            return
-
-        # Pass
+        # Simulate tool call
+        await asyncio.sleep(0)
+        yield _evt("tool_start", {"tool_name": "mock_tool"})
+        await asyncio.sleep(0)
         yield _evt(
             "tool_complete",
             {
@@ -166,27 +165,60 @@ class MockHermesAdapter:
                 "duration_ms": 100,
             },
         )
+
+        # Usage event
+        await asyncio.sleep(0)
         yield _evt(
             "usage",
             {
-                "input_tokens": scenario.get("input_tokens", 0),
-                "output_tokens": scenario.get("output_tokens", 0),
+                "input_tokens": scenario.get("input_tokens", 500),
+                "output_tokens": scenario.get("output_tokens", 200),
             },
         )
 
-        completed_payload = CompletedPayload(
-            summary=scenario.get("summary", ""),
+        # Terminal event
+        await asyncio.sleep(0)
+        if outcome == "fail":
+            state.status = RunStatus.FAILED
+            yield _evt("error", {"code": "mock_error", "message": scenario.get("error_message", "mock failure")})
+        else:
+            state.status = RunStatus.COMPLETED
+            yield _evt(
+                "completed",
+                CompletedPayload(
+                    summary=scenario.get("summary", ""),
+                    files_changed=scenario.get("files_changed", []),
+                    tests_run=True,
+                    unresolved_risks=[],
+                ).model_dump(),
+            )
+
+    # ── Legacy shim (backward compat with tests using run_id strings) ─────────
+
+    async def result(self, run_id: str) -> AgentResult:
+        """Backward-compat shim — prefer wait(handle)."""
+        handle = RunHandle(run_id=run_id, task_id=self._runs[run_id].task_id)
+        return await self.wait(handle)
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _build_result(self, run_id: str, state: _RunState) -> AgentResult:
+        scenario = state.scenario
+        return AgentResult(
+            run_id=run_id,
+            task_id=state.task_id,
+            status=state.status,
+            usage=Usage(
+                input_tokens=scenario.get("input_tokens", 0),
+                output_tokens=scenario.get("output_tokens", 0),
+                total_tokens=scenario.get("input_tokens", 0) + scenario.get("output_tokens", 0),
+                estimated_cost_usd=estimate_cost(
+                    scenario.get("model", "claude-sonnet-4"),
+                    scenario.get("input_tokens", 0),
+                    scenario.get("output_tokens", 0),
+                ),
+            ),
             files_changed=scenario.get("files_changed", []),
-            tests_run=True,
+            summary=scenario.get("summary", ""),
+            error=scenario.get("error_message"),
         )
-        yield _evt("completed", completed_payload.model_dump())
-        state.status = RunStatus.COMPLETED
-
-
-class _RunState:
-    __slots__ = ("task_id", "scenario", "status")
-
-    def __init__(self, task_id: str, scenario: dict) -> None:
-        self.task_id = task_id
-        self.scenario = scenario
-        self.status = RunStatus.PENDING

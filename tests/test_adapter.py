@@ -26,7 +26,7 @@ class TestMockAdapter:
         adapter = MockHermesAdapter()
         adapter.enqueue_scenario("pass", files_changed=["src/auth.py"], summary="done")
         handle = await adapter.submit(make_task())
-        result = await adapter.result(handle.run_id)
+        result = await adapter.wait(handle)
         assert result.status == RunStatus.COMPLETED
         assert "src/auth.py" in result.files_changed
         assert result.summary == "done"
@@ -36,7 +36,7 @@ class TestMockAdapter:
         adapter = MockHermesAdapter()
         adapter.enqueue_scenario("fail", error_message="tool crashed")
         handle = await adapter.submit(make_task())
-        result = await adapter.result(handle.run_id)
+        result = await adapter.wait(handle)
         assert result.status == RunStatus.FAILED
         assert "tool crashed" in (result.error or "")
 
@@ -45,16 +45,16 @@ class TestMockAdapter:
         adapter = MockHermesAdapter()
         adapter.enqueue_scenario("pass")
         handle = await adapter.submit(make_task())
-        await adapter.cancel(handle.run_id)
-        status = await adapter.status(handle.run_id)
-        assert status == RunStatus.CANCELLED
+        await adapter.cancel(handle)
+        # After cancel the internal state is CANCELLED
+        assert adapter._runs[handle.run_id].status == RunStatus.CANCELLED
 
     @pytest.mark.asyncio
     async def test_usage_returned(self):
         adapter = MockHermesAdapter()
         adapter.enqueue_scenario("pass", input_tokens=1000, output_tokens=400)
         handle = await adapter.submit(make_task())
-        usage = await adapter.usage(handle.run_id)
+        usage = await adapter.usage(handle)
         assert usage.input_tokens == 1000
         assert usage.output_tokens == 400
         assert usage.total_tokens == 1400
@@ -65,7 +65,7 @@ class TestMockAdapter:
         adapter.enqueue_scenario("pass", files_changed=["a.py"])
         handle = await adapter.submit(make_task())
         events = []
-        async for evt in adapter.events(handle.run_id):
+        async for evt in adapter.events(handle):
             events.append(evt.type)
         assert "completed" in events
         assert "tool_complete" in events
@@ -76,7 +76,7 @@ class TestMockAdapter:
         adapter.enqueue_scenario("fail")
         handle = await adapter.submit(make_task())
         events = []
-        async for evt in adapter.events(handle.run_id):
+        async for evt in adapter.events(handle):
             events.append(evt.type)
         assert "error" in events
         assert "completed" not in events
@@ -86,11 +86,27 @@ class TestMockAdapter:
         adapter = MockHermesAdapter()
         adapter.enqueue_scenario("approval_required")
         handle = await adapter.submit(make_task())
-        status = await adapter.status(handle.run_id)
-        # Status is pending before streaming
-        assert status == RunStatus.PENDING
-        events = [e.type async for e in adapter.events(handle.run_id)]
+        # Internal status is PENDING before streaming
+        assert adapter._runs[handle.run_id].status == RunStatus.PENDING
+        events = [e.type async for e in adapter.events(handle)]
         assert "approval_request" in events
+
+    @pytest.mark.asyncio
+    async def test_capabilities(self):
+        adapter = MockHermesAdapter()
+        caps = await adapter.capabilities()
+        assert caps.streaming_events is True
+        assert caps.cancellation is True
+
+    @pytest.mark.asyncio
+    async def test_cost_estimated(self):
+        """estimated_cost_usd must be non-zero for non-trivial token counts."""
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("pass", input_tokens=1000, output_tokens=500)
+        handle = await adapter.submit(make_task())
+        usage = await adapter.usage(handle)
+        assert usage.estimated_cost_usd is not None
+        assert usage.estimated_cost_usd > 0
 
 
 class TestStateMachine:
@@ -122,7 +138,6 @@ class TestStateMachine:
 
         await record.mark_completed()
         assert record.status == TaskStatus.COMPLETED
-
         await db.close()
 
     @pytest.mark.asyncio
@@ -130,14 +145,12 @@ class TestStateMachine:
         from orchestrator.state_machine import IllegalTransitionError, StateMachine, TaskStatus
         from storage.database import Database
 
-        db = Database(tmp_path / "test2.db")
+        db = Database(tmp_path / "test.db")
         await db.connect()
         sm = StateMachine(db)
 
         task = make_task()
         record = await sm.create(task)
-
         with pytest.raises(IllegalTransitionError):
-            await record.transition(TaskStatus.COMPLETED)  # can't skip states
-
+            await record.transition(TaskStatus.COMPLETED)  # RECEIVED → COMPLETED illegal
         await db.close()

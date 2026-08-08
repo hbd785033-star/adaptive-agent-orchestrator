@@ -3,48 +3,61 @@ AgentRuntime Protocol — the single interface every adapter must implement.
 
 All orchestrator code talks to this; concrete implementations live in
 adapters/hermes/ and adapters/mock.py.
+
+Design notes
+------------
+- Methods accept RunHandle objects, not raw run_id strings.
+  This prevents accidental cross-run ID confusion in concurrent scenarios.
+- capabilities() must be called once after connect() to let the engine
+  know which optional features (steer, delegation, streaming) are available.
+- events() is the primary result path; result()/wait() is a convenience
+  wrapper for callers that don't need streaming.
 """
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
-from contracts.result import AgentEvent, AgentResult, RunHandle, RunStatus, Usage
+from contracts.result import AgentEvent, AgentResult, RunHandle, Usage
 from contracts.task import TaskContract
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeCapabilities:
+    """
+    Feature flags reported by a runtime implementation.
+    Engine and DelegationExecutor consult this before using optional operations.
+    """
+    streaming_events: bool = True      # supports events() generator
+    mid_run_steer: bool = False        # supports steer() while running
+    native_delegation: bool = False    # runtime handles fan-out natively
+    cancellation: bool = True          # supports cancel()
+    session_resume: bool = False       # can reconnect and resume (cursor)
+    max_concurrent_runs: int = 8       # advisory — how many parallel submits are safe
 
 
 @runtime_checkable
 class AgentRuntime(Protocol):
+
+    async def capabilities(self) -> RuntimeCapabilities:
+        """
+        Return feature flags for this runtime instance.
+        Should be cheap / cached — called before each task execution.
+        """
+        ...
+
     async def submit(self, task: TaskContract) -> RunHandle:
-        """Submit a task and return a handle immediately (non-blocking)."""
+        """Submit a task; return a handle immediately (non-blocking)."""
         ...
 
-    async def status(self, run_id: str) -> RunStatus:
-        """Poll current run status."""
-        ...
-
-    async def result(self, run_id: str) -> AgentResult:
+    async def wait(self, handle: RunHandle) -> AgentResult:
         """Block until run is terminal, then return the result."""
         ...
 
-    async def usage(self, run_id: str) -> Usage:
-        """Return accumulated token/cost usage for this run."""
-        ...
-
-    async def cancel(self, run_id: str) -> None:
-        """Request cancellation of a running task."""
-        ...
-
-    async def steer(self, run_id: str, text: str) -> None:
-        """
-        Send a mid-run steering message to the agent.
-        Corresponds to session.steer / subagent.steer in Hermes TUI Gateway.
-        """
-        ...
-
-    def events(
+    async def events(
         self,
-        run_id: str,
+        handle: RunHandle,
         *,
         after: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
@@ -53,13 +66,30 @@ class AgentRuntime(Protocol):
 
         Parameters
         ----------
+        handle:
+            The run to subscribe to.
         after:
-            Cursor — resume from this event ID on reconnect.
-            If None, stream from the beginning.
+            Cursor — resume from this event ID on reconnect (WebSocket drop/reconnect).
+            Pass None to stream from the beginning.
 
         Yields
         ------
         AgentEvent instances in chronological order.
-        The stream ends when a "completed" or "error" event is emitted.
+        Stream ends when a ``completed`` or ``error`` event is emitted.
+        """
+        ...
+
+    async def usage(self, handle: RunHandle) -> Usage:
+        """Return accumulated token/cost usage for this run."""
+        ...
+
+    async def cancel(self, handle: RunHandle) -> None:
+        """Request cancellation of a running task."""
+        ...
+
+    async def steer(self, handle: RunHandle, instruction: str) -> None:
+        """
+        Send a mid-run steering message to the agent.
+        Only call after checking capabilities().mid_run_steer == True.
         """
         ...

@@ -149,6 +149,8 @@ def split_for_delegation(
     n = len(worktrees)
     for i, (child_id, wt_path) in enumerate(worktrees, 1):
         child = inject_constraints(task, worktree_path=wt_path, child_id=child_id)
+        # Inject _child_id so DelegationExecutor can correlate results
+        child.context["_child_id"] = child_id
         # Prepend delegation context
         delegation_header = (
             f"[Delegation context: you are sub-agent {i}/{n} (id={child_id})."

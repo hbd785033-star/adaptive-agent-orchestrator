@@ -3,8 +3,9 @@ Main orchestration engine — ties all layers together.
 
 Flow per task:
     receive → profile → route → budget/approval check
-    → allocate workspace → submit to runtime → stream events
-    → eval gate → record telemetry → transition to COMPLETED or FAILED/RETRY
+    → allocate workspace
+    → single:     inject_constraints → submit → stream → wait → eval → outcome
+    → delegation: split_for_delegation → DelegationExecutor.execute → aggregate → outcome
 """
 from __future__ import annotations
 
@@ -13,15 +14,17 @@ from pathlib import Path
 import structlog
 
 from adapters.runtime import AgentRuntime
+from contracts.delegation import DelegationResult
 from contracts.evaluation import EvalStatus
 from contracts.result import RunStatus
 from contracts.task import TaskContract
 from evals.gate import DeterministicEvalGate
 from orchestrator.budget import ApprovalGate, BudgetConfig, BudgetState
+from orchestrator.delegation_executor import DelegationExecutor
 from orchestrator.profiler import TaskProfiler
 from orchestrator.prompt_guard import inject_constraints, split_for_delegation
 from orchestrator.router import RuleRouter
-from orchestrator.state_machine import StateMachine, TaskRecord
+from orchestrator.state_machine import StateMachine, TaskRecord, TaskStatus
 from orchestrator.workspace import WorkspaceManager
 from storage.database import Database
 from telemetry.events import TelemetryRecorder
@@ -33,8 +36,9 @@ class Orchestrator:
     """
     Top-level controller. One instance per process.
 
-    Usage:
-        async with Orchestrator.build(runtime=adapter) as orch:
+    Usage::
+
+        async with await Orchestrator.build(runtime=adapter) as orch:
             result = await orch.run(task)
     """
 
@@ -61,6 +65,11 @@ class Orchestrator:
         self._eval_gate = eval_gate
         self._wm = workspace_manager
         self._tel = telemetry
+        self._delegation_executor = DelegationExecutor(
+            runtime=runtime,
+            eval_gate=eval_gate,
+            telemetry=telemetry,
+        )
 
     @classmethod
     async def build(
@@ -71,11 +80,12 @@ class Orchestrator:
         policy_path: str = "policies/default.yaml",
     ) -> Orchestrator:
         import yaml
+
         db = Database(Path(db_path))
         await db.connect()
 
         raw = yaml.safe_load(Path(policy_path).read_text())
-        budget_cfg_raw = raw.get("budget", {})
+        budget_cfg_raw = raw.get("budget", )
         budget_config = BudgetConfig(
             max_children=budget_cfg_raw.get("max_children", 2),
             max_depth=budget_cfg_raw.get("max_depth", 1),
@@ -87,7 +97,9 @@ class Orchestrator:
         workspace_manager: WorkspaceManager | None = None
         if Path(repo_path).exists():
             try:
-                workspace_manager = WorkspaceManager(repo_path=repo_path, policy_path=policy_path)
+                workspace_manager = WorkspaceManager(
+                    repo_path=repo_path, policy_path=policy_path
+                )
             except Exception:
                 log.warning("workspace_manager_init_failed", repo_path=repo_path)
 
@@ -130,7 +142,12 @@ class Orchestrator:
             await record.mark_failed(str(exc))
             raise
 
-    async def _execute(self, record: TaskRecord, budget: BudgetState | None = None, is_retry: bool = False) -> dict:
+    async def _execute(
+        self,
+        record: TaskRecord,
+        budget: BudgetState | None = None,
+        is_retry: bool = False,
+    ) -> dict:
         task = record.task
         if budget is None:
             budget = BudgetState(task_id=task.id, config=self._budget_config)
@@ -138,7 +155,7 @@ class Orchestrator:
         # 1. Profile — skip on retry (record already went through PROFILED once)
         if not is_retry:
             profile = self._profiler.profile(task)
-            await record.transition(record.status.__class__.PROFILED)
+            await record.transition(TaskStatus.PROFILED)
             await self._tel.record(task.id, "task_profiled", profile.as_dict())
         else:
             profile = self._profiler.profile(task)  # re-profile but don't transition
@@ -172,59 +189,65 @@ class Orchestrator:
                 return self._summary(record, "abandoned", "declined by user")
 
         # 4. Pre-flight: subtask count vs budget
-        if (decision.route == "delegation"
-                and profile.independent_subtask_count > budget.config.max_children):
+        if (
+            decision.route == "delegation"
+            and profile.independent_subtask_count > budget.config.max_children
+        ):
             log.warning(
                 "subtask_count_exceeds_budget",
                 task_id=task.id,
                 subtask_count=profile.independent_subtask_count,
                 max_children=budget.config.max_children,
             )
-            # Warn but don't abort — clamp to max_children, record in telemetry
-            await self._tel.record(task.id, "subtask_clamped", {
-                "requested": profile.independent_subtask_count,
-                "clamped_to": budget.config.max_children,
-            })
+            await self._tel.record(
+                task.id,
+                "subtask_clamped",
+                {
+                    "requested": profile.independent_subtask_count,
+                    "clamped_to": budget.config.max_children,
+                },
+            )
 
-        # 5. Workspace allocation (write tasks only)
-        worktrees: list[tuple[str, Path]] = []  # [(child_id, path)]
-        if self._wm and self._wm.needs_worktree(task.task_type.value) and decision.route == "delegation":
-                for i in range(budget.config.max_children):
-                    child_id = f"child-{i+1}"
-                    wt = self._wm.allocate(task.id, child_id)
-                    worktrees.append((child_id, wt.worktree_path))
-                    log.info("worktree_allocated", task_id=task.id, child_id=child_id,
-                             worktree_path=str(wt.worktree_path))
+        # ── Branch: DELEGATION ─────────────────────────────────────────────────
+        if decision.route == "delegation":
+            return await self._execute_delegation(record, task, budget, decision)
 
-        # 6. Apply Prompt Guard — encode constraints into goal before submission
-        if decision.route == "delegation" and worktrees:
-            # For delegation: submit one augmented task per child
-            # (the runtime is responsible for fanning out; we produce the primary
-            #  augmented contract here; child contracts are attached to context)
-            child_contracts = split_for_delegation(task, worktrees)
-            guarded_task = child_contracts[0]  # primary context for the runtime
-            guarded_task.context["_delegation_children"] = [
-                c.goal for c in child_contracts
-            ]
-        else:
-            guarded_task = inject_constraints(task)
+        # ── Branch: SINGLE ─────────────────────────────────────────────────────
+        return await self._execute_single(record, task, budget, decision, is_retry)
 
-        # 7. Submit + stream events
+    # ── Single-agent execution ─────────────────────────────────────────────────
+
+    async def _execute_single(
+        self,
+        record: TaskRecord,
+        task: TaskContract,
+        budget: BudgetState,
+        decision,
+        is_retry: bool,
+    ) -> dict:
+        # 5. Prompt Guard
+        guarded_task = inject_constraints(task)
+
+        # 6. Submit
         handle = await self._runtime.submit(guarded_task)
         await record.mark_running(handle.run_id)
         budget.calls_used += 1
-        await self._tel.record(task.id, "task_submitted", {"run_id": handle.run_id}, handle.run_id)
+        await self._tel.record(
+            task.id, "task_submitted", {"run_id": handle.run_id}, handle.run_id
+        )
 
-        # Stream events → collect tool calls, watch for approval requests
-        async for event in self._runtime.events(handle.run_id):
-            await self._tel.record(task.id, f"event_{event.type}", event.payload, handle.run_id)
+        # 7. Stream events — watch for approval / usage / errors
+        async for event in self._runtime.events(handle):
+            await self._tel.record(
+                task.id, f"event_{event.type}", event.payload, handle.run_id
+            )
 
             if event.type == "approval_request":
                 approved = self._approval.prompt_user(
                     event.payload.get("reason", "agent requested approval"), task
                 )
                 if not approved:
-                    await self._runtime.cancel(handle.run_id)
+                    await self._runtime.cancel(handle)
                     await record.mark_failed("approval denied mid-run")
                     return self._summary(record, "failed", "approval denied")
 
@@ -234,62 +257,173 @@ class Orchestrator:
             elif event.type in ("completed", "error"):
                 break
 
-        # 8. Get final result
-        agent_result = await self._runtime.result(handle.run_id)
+        # 8. Collect result
+        agent_result = await self._runtime.wait(handle)
 
-        # If agent itself failed (error event), skip eval and mark failed
         if agent_result.status == RunStatus.FAILED:
             await record.mark_failed(agent_result.error or "agent reported failure")
             return self._summary(record, "failed", agent_result.error or "agent error")
-        usage = agent_result.usage
+
+        usage = await self._runtime.usage(handle)
         await self._db.append_usage(
-            task.id, handle.run_id,
-            usage.input_tokens, usage.output_tokens, usage.estimated_cost_usd
+            task.id,
+            handle.run_id,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.estimated_cost_usd,
         )
 
         # 9. Eval gate
         await record.mark_evaluating()
         eval_result = await self._eval_gate.run(task, agent_result, budget)
         await self._db.append_eval_result(
-            task.id, handle.run_id, eval_result.overall.value,
-            [c.model_dump() for c in eval_result.checks]
+            task.id,
+            handle.run_id,
+            eval_result.overall.value,
+            [c.model_dump() for c in eval_result.checks],
         )
-        await self._tel.record(task.id, "eval_completed", {
-            "overall": eval_result.overall.value,
-            "failed_checks": [c.name for c in eval_result.failed_checks()],
-        }, handle.run_id)
+        await self._tel.record(
+            task.id,
+            "eval_completed",
+            {
+                "overall": eval_result.overall.value,
+                "failed_checks": [c.name for c in eval_result.failed_checks()],
+            },
+            handle.run_id,
+        )
 
         # 10. Outcome
         if eval_result.overall == EvalStatus.PASS:
             await record.mark_completed()
-            if self._wm:
-                for wt_record in list(self._wm.list_records()):
-                    if wt_record.task_id == task.id:
-                        self._wm.mark_merging(task.id, wt_record.child_id)
-            return self._summary(record, "completed", "", eval_result=eval_result, usage=usage)
+            return self._summary(
+                record, "completed", "", eval_result=eval_result, usage=usage
+            )
 
-        # Eval failed — retry if budget allows
+        # Eval failed — retry once if budget allows
         retry_violation = budget.check_retries()
         if not retry_violation:
             await record.mark_failed("eval_failed")
             await record.mark_retry()
             log.info("task_retrying", task_id=task.id, retry=record.retry_count)
             budget.retries_used += 1
-            # On retry: transition back to ROUTED so _execute can re-enter RUNNING
             await record.mark_routed(decision.route)
             return await self._execute(record, budget=budget, is_retry=True)
 
-        # Exhausted retries
         await record.mark_failed("eval_failed_no_retries")
+        return self._summary(
+            record,
+            "failed",
+            "eval failed and retries exhausted",
+            eval_result=eval_result,
+        )
+
+    # ── Delegation execution ───────────────────────────────────────────────────
+
+    async def _execute_delegation(
+        self,
+        record: TaskRecord,
+        task: TaskContract,
+        budget: BudgetState,
+        decision,
+    ) -> dict:
+        # 5. Workspace allocation (write tasks only)
+        worktrees: list[tuple[str, Path]] = []
+        if (
+            self._wm
+            and self._wm.needs_worktree(task.task_type.value)
+        ):
+            for i in range(budget.config.max_children):
+                child_id = f"child-{i+1}"
+                wt = self._wm.allocate(task.id, child_id)
+                worktrees.append((child_id, wt.worktree_path))
+                log.info(
+                    "worktree_allocated",
+                    task_id=task.id,
+                    child_id=child_id,
+                    worktree_path=str(wt.worktree_path),
+                )
+
+        # 6. Prompt Guard — produce one contract per child
+        if worktrees:
+            child_contracts = split_for_delegation(task, worktrees)
+        else:
+            # No worktrees (read-only delegation) — create N copies with child_id injected
+            child_contracts = []
+            for i in range(budget.config.max_children):
+                child_id = f"child-{i+1}"
+                from copy import deepcopy
+                child = inject_constraints(deepcopy(task))
+                child.context["_child_id"] = child_id
+                child_contracts.append(child)
+
+        # 7. Mark running (using sentinel run_id for delegation parent)
+        await record.mark_running(f"delegation:{task.id}")
+        budget.calls_used += 1
+
+        # 8. Execute children concurrently via DelegationExecutor
+        delegation_result: DelegationResult = await self._delegation_executor.execute(
+            parent_task_id=task.id,
+            children=child_contracts,
+            budget=budget,
+        )
+
+        # Record aggregate usage
+        await self._db.append_usage(
+            task.id,
+            f"delegation:{task.id}",
+            delegation_result.total_input_tokens,
+            delegation_result.total_output_tokens,
+            delegation_result.total_cost_usd,
+        )
+
+        # 9. Evaluate overall outcome
+        await record.mark_evaluating()
+        status = delegation_result.overall_status
+
+        await self._tel.record(
+            task.id,
+            "delegation_outcome",
+            {
+                "status": status,
+                "successful": delegation_result.successful,
+                "failed": delegation_result.failed,
+                "children": len(delegation_result.children),
+            },
+        )
+
+        if status == "completed":
+            await record.mark_completed()
+            if self._wm:
+                for wt_record in list(self._wm.list_records()):
+                    if wt_record.task_id == task.id:
+                        self._wm.mark_merging(task.id, wt_record.child_id)
+            return self._summary_delegation(record, delegation_result)
+
+        if status == "partial_failed":
+            # Partial failure — deliver with warning, human can decide
+            await record.mark_completed()
+            return self._summary_delegation(
+                record,
+                delegation_result,
+                detail=f"{delegation_result.failed} of {len(delegation_result.children)} children failed",
+            )
+
+        # All failed
+        await record.mark_failed("all_children_failed")
         if self._wm:
             for wt_record in list(self._wm.list_records()):
                 if wt_record.task_id == task.id:
                     self._wm.abandon(task.id, wt_record.child_id)
+        return self._summary_delegation(
+            record, delegation_result, detail="all delegation children failed"
+        )
 
-        return self._summary(record, "failed", "eval failed and retries exhausted", eval_result=eval_result)
+    # ── Summary helpers ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _summary(record: TaskRecord, outcome: str, detail: str, **extra) -> dict:
+    def _summary(
+        record: TaskRecord, outcome: str, detail: str, **extra
+    ) -> dict:
         d: dict = {
             "task_id": record.task.id,
             "outcome": outcome,
@@ -309,5 +443,32 @@ class Orchestrator:
                 "input_tokens": u.input_tokens,
                 "output_tokens": u.output_tokens,
                 "total_tokens": u.total_tokens,
+                "estimated_cost_usd": u.estimated_cost_usd,
             }
         return d
+
+    @staticmethod
+    def _summary_delegation(
+        record: TaskRecord,
+        dr: DelegationResult,
+        detail: str = "",
+    ) -> dict:
+        return {
+            "task_id": record.task.id,
+            "outcome": dr.overall_status,
+            "route": "delegation",
+            "retry_count": record.retry_count,
+            "detail": detail,
+            "delegation": {
+                "children": len(dr.children),
+                "successful": dr.successful,
+                "failed": dr.failed,
+                "duration_ms": dr.duration_ms,
+            },
+            "usage": {
+                "input_tokens": dr.total_input_tokens,
+                "output_tokens": dr.total_output_tokens,
+                "total_tokens": dr.total_input_tokens + dr.total_output_tokens,
+                "estimated_cost_usd": dr.total_cost_usd,
+            },
+        }
