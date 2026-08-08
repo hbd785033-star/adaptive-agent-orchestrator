@@ -25,10 +25,10 @@ class RiskLevel(int, Enum):
 
 class WorkspaceSpec(BaseModel):
     """Injected by WorkspaceManager before execution starts."""
-    repo_path: str
-    worktree_path: str | None = None   # None → read-only / single-agent tasks
+    path: str                           # absolute path the agent must work inside
     branch: str | None = None
     child_id: str | None = None
+    repo_path: str | None = None        # root repo; optional, for reference only
 
 
 class TaskContract(BaseModel):

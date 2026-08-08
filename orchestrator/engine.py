@@ -23,6 +23,7 @@ from orchestrator.budget import ApprovalGate, BudgetConfig, BudgetState
 from orchestrator.profiler import TaskProfiler
 from orchestrator.router import RuleRouter
 from orchestrator.state_machine import StateMachine, TaskRecord, TaskStatus
+from orchestrator.prompt_guard import inject_constraints, split_for_delegation
 from orchestrator.workspace import WorkspaceManager
 from storage.database import Database
 from telemetry.events import TelemetryRecorder
@@ -173,16 +174,31 @@ class Orchestrator:
                 return self._summary(record, "abandoned", "declined by user")
 
         # 4. Workspace allocation (write tasks only)
+        worktrees: list[tuple[str, Path]] = []  # [(child_id, path)]
         if self._wm and self._wm.needs_worktree(task.task_type.value):
             if decision.route == "delegation":
                 for i in range(budget.config.max_children):
                     child_id = f"child-{i+1}"
                     wt = self._wm.allocate(task.id, child_id)
+                    worktrees.append((child_id, wt.worktree_path))
                     log.info("worktree_allocated", task_id=task.id, child_id=child_id,
                              worktree_path=str(wt.worktree_path))
 
-        # 5. Submit + stream events
-        handle = await self._runtime.submit(task)
+        # 5. Apply Prompt Guard — encode constraints into goal before submission
+        if decision.route == "delegation" and worktrees:
+            # For delegation: submit one augmented task per child
+            # (the runtime is responsible for fanning out; we produce the primary
+            #  augmented contract here; child contracts are attached to context)
+            child_contracts = split_for_delegation(task, worktrees)
+            guarded_task = child_contracts[0]  # primary context for the runtime
+            guarded_task.context["_delegation_children"] = [
+                c.goal for c in child_contracts
+            ]
+        else:
+            guarded_task = inject_constraints(task)
+
+        # 6. Submit + stream events
+        handle = await self._runtime.submit(guarded_task)
         await record.mark_running(handle.run_id)
         budget.calls_used += 1
         await self._tel.record(task.id, "task_submitted", {"run_id": handle.run_id}, handle.run_id)
