@@ -93,35 +93,71 @@ class HermesAdapter:
         self._handles: dict[str, RunHandle] = {}
         self._run_state: dict[str, dict[str, Any]] = {}
         self._completed_results: dict[str, AgentResult] = {}
+        self._completion_events: dict[str, asyncio.Event] = {}
+        self._subscription_locks: dict[str, asyncio.Lock] = {}
+        self._subscribed_runs: set[str] = set()
         self._recv_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
         self._connected = asyncio.Event()
+        self._shutdown = False
+        self._connection_generation = 0
 
     # ── Connection management ─────────────────────────────────────────────────
 
     async def connect(self) -> None:
         """Establish WebSocket connection and start the receive loop."""
+        self._shutdown = False
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         self._ws = await websockets.connect(self._url, additional_headers=headers)
+        self._connection_generation += 1
         self._connected.set()
         self._recv_task = asyncio.create_task(self._recv_loop(), name="hermes-recv")
 
     async def disconnect(self) -> None:
+        if self._shutdown and self._ws is None:
+            return
+        self._shutdown = True
+        self._connection_generation += 1
+        self._connected.clear()
+        reconnect_task = self._reconnect_task
+        self._reconnect_task = None
+        if reconnect_task and reconnect_task is not asyncio.current_task():
+            reconnect_task.cancel()
+        await self._fail_active_runs("Hermes Gateway disconnected")
+        self._fail_pending(ConnectionError("Hermes Gateway disconnected"))
         if self._recv_task:
             self._recv_task.cancel()
-        if self._ws:
-            await self._ws.close()
-        self._connected.clear()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._recv_task
+            self._recv_task = None
+        websocket, self._ws = self._ws, None
+        if websocket:
+            await websocket.close()
 
     async def _ensure_connected(self) -> None:
+        if self._shutdown:
+            raise ConnectionError("Hermes Gateway adapter is explicitly disconnected")
         if not self._connected.is_set():
             await self.connect()
 
     async def _reconnect(self) -> None:
-        self._connected.clear()
-        await asyncio.sleep(self._reconnect_delay)
-        with contextlib.suppress(Exception):
-            await self.connect()
-            # retry handled by caller if this also fails
+        try:
+            self._connected.clear()
+            await asyncio.sleep(self._reconnect_delay)
+            if self._shutdown:
+                return
+            with contextlib.suppress(Exception):
+                await self.connect()
+                # retry handled by caller if this also fails
+        finally:
+            if self._reconnect_task is asyncio.current_task():
+                self._reconnect_task = None
+
+    def _fail_pending(self, error: Exception) -> None:
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(error)
+        self._pending.clear()
 
     # ── Receive loop (fan-out) ────────────────────────────────────────────────
 
@@ -143,22 +179,37 @@ class HermesAdapter:
                     run_id = data.get("run_id")
                     if run_id:
                         queue = self._event_queues.setdefault(run_id, asyncio.Queue())
-                        await queue.put(data.get("event", data))
+                        raw = data.get("event", data)
+                        await queue.put(raw)
+                        handle = self._handles.get(run_id)
+                        if handle is not None:
+                            self._record_event(handle, _parse_event(raw))
         except ConnectionClosed:
-            for run_id, queue in self._event_queues.items():
-                if run_id not in self._completed_results:
-                    await queue.put({
-                        "run_id": run_id,
-                        "type": "error",
-                        "payload": {
-                            "message": "Hermes Gateway disconnected; run resume is unsupported"
-                        },
-                    })
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(ConnectionError("Hermes Gateway disconnected"))
-            self._pending.clear()
-            asyncio.create_task(self._reconnect())
+            self._connection_generation += 1
+            self._connected.clear()
+            await self._fail_active_runs(
+                "Hermes Gateway disconnected; run resume is unsupported"
+            )
+            self._fail_pending(ConnectionError("Hermes Gateway disconnected"))
+            if not self._shutdown and (
+                self._reconnect_task is None or self._reconnect_task.done()
+            ):
+                self._reconnect_task = asyncio.create_task(self._reconnect())
+
+    async def _fail_active_runs(self, message: str) -> None:
+        """Make every known active run terminal and wake any stream consumer."""
+        for run_id, queue in self._event_queues.items():
+            if run_id in self._completed_results:
+                continue
+            raw = {
+                "run_id": run_id,
+                "type": "error",
+                "payload": {"message": message},
+            }
+            await queue.put(raw)
+            handle = self._handles.get(run_id)
+            if handle is not None:
+                self._record_event(handle, _parse_event(raw))
 
     # ── RPC helper ────────────────────────────────────────────────────────────
 
@@ -191,6 +242,8 @@ class HermesAdapter:
         # 1. Create a new session
         session = await self._call("session.create", {"label": f"task-{task.id[:8]}"})
         session_id = session["session_id"]
+        submit_generation = self._connection_generation
+        was_connected = self._connected.is_set()
 
         # 2. Submit prompt with constraint preamble
         result = await self._call(
@@ -204,7 +257,7 @@ class HermesAdapter:
         run_id = result["run_id"]
 
         # Register event queue for this run
-        self._event_queues[run_id] = asyncio.Queue()
+        self._event_queues.setdefault(run_id, asyncio.Queue())
 
         handle = RunHandle(run_id=run_id, task_id=task.id, session_id=session_id)
         self._handles[run_id] = handle
@@ -215,7 +268,52 @@ class HermesAdapter:
             "usage": Usage(),
             "status": RunStatus.RUNNING,
         }
+        disconnected_during_submit = (
+            self._shutdown
+            or self._connection_generation != submit_generation
+            or (was_connected and not self._connected.is_set())
+        )
+        if disconnected_during_submit:
+            self._record_event(handle, _parse_event({
+                "run_id": run_id,
+                "type": "error",
+                "payload": {
+                    "message": "Hermes Gateway disconnected before run registration"
+                },
+            }))
+        # A terminal push may arrive before prompt.submit returns.
+        self._record_buffered_events(handle)
         return handle
+
+    def _record_buffered_events(self, handle: RunHandle) -> None:
+        """Record a queue snapshot without consuming it from stream clients."""
+        queue = self._event_queues.setdefault(handle.run_id, asyncio.Queue())
+        buffered: list[dict[str, Any]] = []
+        while True:
+            try:
+                buffered.append(queue.get_nowait())
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        for raw in buffered:
+            queue.put_nowait(raw)
+            self._record_event(handle, _parse_event(raw))
+
+    async def _subscribe(
+        self, handle: RunHandle, *, after: str | None = None
+    ) -> None:
+        """Subscribe once per run so waiters and stream clients cannot race."""
+        lock = self._subscription_locks.setdefault(handle.run_id, asyncio.Lock())
+        async with lock:
+            if after is None and handle.run_id in self._subscribed_runs:
+                return
+            params: dict[str, Any] = {"run_id": handle.run_id}
+            if after:
+                params["after"] = after
+            await self._call("session.subscribe", params)
+            if after is None:
+                self._subscribed_runs.add(handle.run_id)
+            self._record_buffered_events(handle)
 
     async def status(self, handle: RunHandle) -> RunStatus:
         result = await self._call("session.status", {"run_id": handle.run_id})
@@ -230,6 +328,12 @@ class HermesAdapter:
         return _status_map.get(result.get("status", ""), RunStatus.RUNNING)
 
     def _record_event(self, handle: RunHandle, event: AgentEvent) -> None:
+        if (
+            event.type in ("completed", "error")
+            and handle.run_id in self._completed_results
+        ):
+            self._completion_events.setdefault(handle.run_id, asyncio.Event()).set()
+            return
         state = self._run_state.setdefault(handle.run_id, {
             "files_changed": [], "summary": "", "error": None,
             "usage": Usage(), "status": RunStatus.RUNNING,
@@ -272,11 +376,21 @@ class HermesAdapter:
                 summary=state["summary"],
                 error=state["error"],
             )
+            self._completion_events.setdefault(handle.run_id, asyncio.Event()).set()
 
     async def wait(self, handle: RunHandle) -> AgentResult:
         if handle.run_id not in self._completed_results:
-            async for _ in self.events(handle):
-                pass
+            try:
+                await self._subscribe(handle)
+            except Exception:
+                if handle.run_id not in self._completed_results:
+                    raise
+            completion = self._completion_events.setdefault(
+                handle.run_id, asyncio.Event()
+            )
+            if handle.run_id in self._completed_results:
+                completion.set()
+            await completion.wait()
         return self._completed_results[handle.run_id]
 
     async def result(self, run_id: str) -> AgentResult:
@@ -308,18 +422,12 @@ class HermesAdapter:
         *,
         after: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        # Subscribe on Gateway
-        if handle.run_id in self._completed_results:
+        queue = self._event_queues.setdefault(handle.run_id, asyncio.Queue())
+        # A completed result can still have an early buffered stream to deliver.
+        if handle.run_id in self._completed_results and queue.empty():
             return
-        params: dict[str, Any] = {"run_id": handle.run_id}
-        if after:
-            params["after"] = after
-        await self._call("session.subscribe", params)
-
-        if handle.run_id not in self._event_queues:
-            self._event_queues[handle.run_id] = asyncio.Queue()
-
-        queue = self._event_queues[handle.run_id]
+        if handle.run_id not in self._completed_results:
+            await self._subscribe(handle, after=after)
         while True:
             raw = await queue.get()
             event = _parse_event(raw)
