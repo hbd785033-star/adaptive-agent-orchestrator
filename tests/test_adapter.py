@@ -1,15 +1,309 @@
 """Tests for MockHermesAdapter and state machine."""
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 
+from adapters.hermes.gateway import HermesAdapter, _parse_event
 from adapters.mock import MockHermesAdapter
-from contracts.result import RunStatus
-from contracts.task import TaskContract
+from adapters.runtime import AgentRuntime
+from contracts.result import RunHandle, RunStatus
+from contracts.task import TaskContract, WorkspaceSpec
 
 
 def make_task(**kwargs) -> TaskContract:
     return TaskContract(goal="test task", **kwargs)
+
+
+class FakeGatewayAdapter(HermesAdapter):
+    """No-network Gateway contract harness."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    async def _call(self, method, params):
+        self.calls.append((method, params))
+        if method == "session.create":
+            return {"session_id": "session-1"}
+        if method == "prompt.submit":
+            return {"run_id": "run-1"}
+        if method == "session.subscribe":
+            queue = self._event_queues[params["run_id"]]
+            await queue.put({
+                "id": "usage-1", "run_id": params["run_id"], "type": "usage",
+                "payload": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            })
+            await queue.put({
+                "id": "done-1", "run_id": params["run_id"], "type": "completed",
+                "payload": {"summary": "done", "files_changed": ["src/a.py"]},
+            })
+            return {}
+        if method == "session.usage":
+            return {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return {}
+
+
+class TestHermesAdapterContract:
+    @pytest.mark.asyncio
+    async def test_real_adapter_satisfies_runtime_protocol_and_uses_run_handles(self):
+        adapter = FakeGatewayAdapter()
+        assert isinstance(adapter, AgentRuntime)
+        caps = await adapter.capabilities()
+        assert caps.streaming_events is True
+        assert caps.session_resume is False
+        handle = await adapter.submit(make_task())
+        result = await adapter.wait(handle)
+        usage = await adapter.usage(handle)
+        await adapter.cancel(handle)
+        await adapter.steer(handle, "continue")
+
+        assert result.task_id == handle.task_id
+        assert result.status == RunStatus.COMPLETED
+        assert result.summary == "done"
+        assert usage.total_tokens == 15
+        run_scoped = [params for method, params in adapter.calls if method.startswith("session.") and "run_id" in params]
+        assert run_scoped
+        assert all(params["run_id"] == "run-1" for params in run_scoped)
+        assert all(not isinstance(params["run_id"], RunHandle) for params in run_scoped)
+
+    def test_workspace_prompt_uses_declared_path_field(self):
+        task = make_task(workspace=WorkspaceSpec(path="D:/worktree", branch="agent/test"))
+        prompt = task.prompt_preamble()
+        assert "D:/worktree" in prompt
+        assert "agent/test" in prompt
+
+    @pytest.mark.asyncio
+    async def test_receive_loop_buffers_event_before_submit_registers_queue(self):
+        class EarlyEventWebSocket:
+            def __aiter__(self):
+                async def messages():
+                    yield json.dumps({
+                        "type": "event",
+                        "run_id": "run-early",
+                        "event": {
+                            "run_id": "run-early",
+                            "type": "completed",
+                            "payload": {"summary": "early", "files_changed": []},
+                        },
+                    })
+                return messages()
+
+        adapter = HermesAdapter()
+        adapter._ws = EarlyEventWebSocket()
+        await adapter._recv_loop()
+
+        assert "run-early" in adapter._event_queues
+        buffered = await adapter._event_queues["run-early"].get()
+        assert buffered["type"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_submit_preserves_early_event_queue_and_wait_completes(self):
+        class EarlyEventAdapter(HermesAdapter):
+            async def _call(self, method, params):
+                if method == "session.create":
+                    return {"session_id": "session-early"}
+                if method == "prompt.submit":
+                    queue = self._event_queues.setdefault("run-early", asyncio.Queue())
+                    await queue.put({
+                        "run_id": "run-early",
+                        "type": "completed",
+                        "payload": {"summary": "arrived before submit returned"},
+                    })
+                    return {"run_id": "run-early"}
+                if method == "session.subscribe":
+                    return {}
+                raise AssertionError(method)
+
+        adapter = EarlyEventAdapter()
+        early_queue = adapter._event_queues.setdefault("run-early", asyncio.Queue())
+        handle = await adapter.submit(make_task())
+
+        assert adapter._event_queues[handle.run_id] is early_queue
+        result = await asyncio.wait_for(adapter.wait(handle), timeout=1)
+        assert result.status == RunStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_disconnect_fails_active_run_and_wait_returns(self):
+        class DummyWebSocket:
+            async def close(self):
+                return None
+
+        adapter = HermesAdapter()
+        handle = RunHandle(run_id="run-disconnect", task_id="task-disconnect")
+        adapter._handles[handle.run_id] = handle
+        adapter._event_queues[handle.run_id] = asyncio.Queue()
+        adapter._ws = DummyWebSocket()
+        adapter._connected.set()
+
+        await adapter.disconnect()
+        result = await asyncio.wait_for(adapter.wait(handle), timeout=1)
+
+        assert result.status == RunStatus.FAILED
+        assert "disconnected" in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_wait_and_event_stream_do_not_compete_for_terminal_event(self):
+        class SubscriptionAdapter(HermesAdapter):
+            async def _call(self, method, params):
+                assert method == "session.subscribe"
+                return {}
+
+        adapter = SubscriptionAdapter()
+        handle = RunHandle(run_id="run-shared", task_id="task-shared")
+        adapter._handles[handle.run_id] = handle
+        queue = adapter._event_queues.setdefault(handle.run_id, asyncio.Queue())
+
+        stream = adapter.events(handle)
+        stream_task = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        wait_task = asyncio.create_task(adapter.wait(handle))
+        await asyncio.sleep(0)
+
+        await queue.put({
+            "run_id": handle.run_id,
+            "type": "completed",
+            "payload": {"summary": "done"},
+        })
+        streamed = await asyncio.wait_for(stream_task, timeout=1)
+        result = await asyncio.wait_for(wait_task, timeout=1)
+
+        assert streamed.type == "completed"
+        assert result.status == RunStatus.COMPLETED
+        await stream.aclose()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_unblocks_pending_subscription_rpc(self):
+        class PendingWebSocket:
+            def __init__(self):
+                self.sent = asyncio.Event()
+                self.close_count = 0
+
+            async def send(self, _payload):
+                self.sent.set()
+
+            async def close(self):
+                self.close_count += 1
+
+        adapter = HermesAdapter()
+        ws = PendingWebSocket()
+        adapter._ws = ws
+        adapter._connected.set()
+        handle = RunHandle(run_id="run-pending", task_id="task-pending")
+        adapter._handles[handle.run_id] = handle
+        adapter._event_queues[handle.run_id] = asyncio.Queue()
+
+        waiter = asyncio.create_task(adapter.wait(handle))
+        await asyncio.wait_for(ws.sent.wait(), timeout=1)
+        await adapter.disconnect()
+        result = await asyncio.wait_for(waiter, timeout=1)
+
+        assert result.status == RunStatus.FAILED
+        assert not adapter._pending
+        assert ws.close_count == 1
+
+    @pytest.mark.asyncio
+    async def test_disconnect_during_submit_registration_gap_returns_failed_handle(self):
+        class GapAdapter(HermesAdapter):
+            async def _call(self, method, params):
+                if method == "session.create":
+                    self._connected.set()
+                    return {"session_id": "session-gap"}
+                if method == "prompt.submit":
+                    await self._fail_active_runs("gap disconnect")
+                    self._connected.clear()
+                    return {"run_id": "run-gap"}
+                if method == "session.subscribe":
+                    return {}
+                raise AssertionError(method)
+
+        adapter = GapAdapter()
+        handle = await adapter.submit(make_task())
+        result = await asyncio.wait_for(adapter.wait(handle), timeout=1)
+        assert result.status == RunStatus.FAILED
+        assert "disconnect" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_early_buffered_stream_is_still_emitted_in_order(self):
+        class EarlyStreamAdapter(HermesAdapter):
+            async def _call(self, method, params):
+                if method == "session.create":
+                    return {"session_id": "session-stream"}
+                if method == "prompt.submit":
+                    queue = self._event_queues.setdefault("run-stream", asyncio.Queue())
+                    for event_type, payload in (
+                        ("tool_complete", {"files_written": ["early.py"]}),
+                        ("usage", {"total_tokens": 10}),
+                        ("completed", {"summary": "early"}),
+                    ):
+                        await queue.put({
+                            "run_id": "run-stream", "type": event_type,
+                            "payload": payload,
+                        })
+                    return {"run_id": "run-stream"}
+                if method == "session.subscribe":
+                    return {}
+                raise AssertionError(method)
+
+        adapter = EarlyStreamAdapter()
+        handle = await adapter.submit(make_task())
+        result = await adapter.wait(handle)
+        streamed = [event.type async for event in adapter.events(handle)]
+
+        assert result.status == RunStatus.COMPLETED
+        assert streamed == ["tool_complete", "usage", "completed"]
+        assert adapter._event_queues[handle.run_id].empty()
+
+    @pytest.mark.asyncio
+    async def test_explicit_disconnect_cancels_reconnect_and_is_idempotent(self):
+        class ReconnectAdapter(HermesAdapter):
+            def __init__(self):
+                super().__init__(reconnect_delay=0.01)
+                self.connect_count = 0
+
+            async def connect(self):
+                self.connect_count += 1
+                self._connected.set()
+
+        class DummyWebSocket:
+            def __init__(self):
+                self.close_count = 0
+
+            async def close(self):
+                self.close_count += 1
+
+        adapter = ReconnectAdapter()
+        ws = DummyWebSocket()
+        adapter._ws = ws
+        reconnect = asyncio.create_task(adapter._reconnect())
+        await adapter.disconnect()
+        await adapter.disconnect()
+        await reconnect
+
+        assert adapter.connect_count == 0
+        assert ws.close_count == 1
+        assert not adapter._connected.is_set()
+
+    def test_first_terminal_event_wins(self):
+        adapter = HermesAdapter()
+        handle = RunHandle(run_id="run-first", task_id="task-first")
+        adapter._record_event(handle, _parse_event({
+            "run_id": handle.run_id,
+            "type": "completed",
+            "payload": {"summary": "first"},
+        }))
+        adapter._record_event(handle, _parse_event({
+            "run_id": handle.run_id,
+            "type": "error",
+            "payload": {"message": "late"},
+        }))
+
+        result = adapter._completed_results[handle.run_id]
+        assert result.status == RunStatus.COMPLETED
+        assert result.summary == "first"
+        assert result.error is None
 
 
 class TestMockAdapter:

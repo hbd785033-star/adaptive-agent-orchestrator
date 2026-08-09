@@ -52,6 +52,12 @@ class TestCostEstimator:
         # Should not have more than 6 decimal places
         assert result == round(result, 6)
 
+    def test_specific_model_name_wins_over_prefix_match(self):
+        assert estimate_cost("gpt-4o-mini", 1_000_000, 0) == 0.15
+
+    def test_provider_prefixed_model_uses_model_price(self):
+        assert estimate_cost("openai:gpt-4o-mini", 1_000_000, 0) == 0.15
+
 
 # ── 2. MockAdapter cost propagation ──────────────────────────────────────────
 
@@ -102,10 +108,11 @@ class TestSubtaskClamping:
             db_path=str(tmp_path / "test.db"),
             policy_path="policies/default.yaml",
         ) as orch:
-            # multi_file_refactor with 3 subtasks but budget allows only 2
+            # Read-only parallel task isolates clamping behaviour from the
+            # separate dirty-root worktree safety gate.
             task = TaskContract(
-                goal="refactor src/a and src/b and src/c independently",
-                task_type=TaskType.MULTI_FILE_REFACTOR,
+                goal="research src/a and src/b and src/c independently",
+                task_type=TaskType.PARALLEL_RESEARCH,
                 complexity=4,
             )
             with caplog.at_level(logging.WARNING, logger="orchestrator.engine"):

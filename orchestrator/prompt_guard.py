@@ -135,7 +135,7 @@ def _build_constraints_block(
 
 def split_for_delegation(
     task: TaskContract,
-    worktrees: list[tuple[str, Path]],  # [(child_id, worktree_path), ...]
+    worktrees: list[tuple[str, Path | None]],
 ) -> list[TaskContract]:
     """
     Produce one augmented child contract per worktree.
@@ -147,8 +147,26 @@ def split_for_delegation(
     """
     children = []
     n = len(worktrees)
+    if task.subtasks and len(task.subtasks) != n:
+        raise ValueError(
+            f"explicit subtask count ({len(task.subtasks)}) must match child count ({n})"
+        )
     for i, (child_id, wt_path) in enumerate(worktrees, 1):
-        child = inject_constraints(task, worktree_path=wt_path, child_id=child_id)
+        base = deepcopy(task)
+        if task.subtasks:
+            subtask = task.subtasks[i - 1]
+            base.goal = subtask.goal
+            if subtask.allowed_paths:
+                base.allowed_paths = list(subtask.allowed_paths)
+            base.parent_task_id = task.id
+            base.subtasks = []
+            base.context["_subtask_id"] = subtask.id
+            base.context["_dependencies"] = list(subtask.dependencies)
+            base.context["_expected_output"] = subtask.expected_output
+            base.context["_decomposition_mode"] = "explicit"
+        else:
+            base.context["_decomposition_mode"] = "replicated_goal"
+        child = inject_constraints(base, worktree_path=wt_path, child_id=child_id)
         # Inject _child_id so DelegationExecutor can correlate results
         child.context["_child_id"] = child_id
         # Prepend delegation context

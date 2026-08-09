@@ -1,7 +1,9 @@
 """Tests for PromptGuard — constraint injection and delegation splitting."""
 from __future__ import annotations
 
-from contracts.task import RiskLevel, TaskContract, TaskType, WorkspaceSpec
+import pytest
+
+from contracts.task import RiskLevel, SubtaskSpec, TaskContract, TaskType, WorkspaceSpec
 from orchestrator.prompt_guard import inject_constraints, split_for_delegation
 
 
@@ -91,6 +93,43 @@ class TestInjectConstraints:
 
 
 class TestSplitForDelegation:
+    def test_explicit_subtasks_receive_distinct_goals_and_scope(self, tmp_path):
+        task = make_task(subtasks=[
+            SubtaskSpec(id="auth", goal="Audit authentication security", allowed_paths=["src/auth/**"]),
+            SubtaskSpec(
+                id="db",
+                goal="Optimize database queries",
+                allowed_paths=["src/db/**"],
+                dependencies=["auth"],
+                expected_output="query profile",
+            ),
+        ])
+
+        children = split_for_delegation(
+            task,
+            [("child-1", tmp_path / "c1"), ("child-2", tmp_path / "c2")],
+        )
+
+        assert "Audit authentication security" in children[0].goal
+        assert "Optimize database queries" not in children[0].goal
+        assert "Optimize database queries" in children[1].goal
+        assert children[0].allowed_paths == ["src/auth/**"]
+        assert children[1].context["_dependencies"] == ["auth"]
+        assert children[1].context["_expected_output"] == "query profile"
+        assert children[0].subtasks == []
+
+    def test_duplicate_or_cyclic_subtasks_are_rejected(self):
+        with pytest.raises(ValueError, match="unique goals"):
+            make_task(subtasks=[
+                SubtaskSpec(id="a", goal="same"),
+                SubtaskSpec(id="b", goal="same"),
+            ])
+        with pytest.raises(ValueError, match="cycle"):
+            make_task(subtasks=[
+                SubtaskSpec(id="a", goal="first", dependencies=["b"]),
+                SubtaskSpec(id="b", goal="second", dependencies=["a"]),
+            ])
+
     def test_produces_one_contract_per_worktree(self, tmp_path):
         task = make_task()
         worktrees = [

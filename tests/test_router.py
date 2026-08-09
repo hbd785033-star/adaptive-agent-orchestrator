@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from contracts.task import TaskContract, TaskType
+from contracts.task import SubtaskSpec, TaskContract, TaskType
 from orchestrator.router import RuleRouter
 
 
@@ -80,6 +80,19 @@ class TestSimpleTaskGoesToSingle:
 
 
 class TestDelegationTriggers:
+    def test_explicit_subtask_dag_routes_to_delegation(self, router):
+        task = make_task(subtasks=[
+            SubtaskSpec(id="a", goal="first"),
+            SubtaskSpec(id="b", goal="second", dependencies=["a"]),
+        ])
+        decision = router.route(
+            task,
+            independent_subtask_count=2,
+            has_sequential_dependency=True,
+        )
+        assert decision.route == "delegation"
+        assert "explicit_subtasks" in " ".join(decision.reasons)
+
     def test_allowed_task_type_triggers_delegation(self, router):
         task = make_task(task_type=TaskType.MULTI_FILE_REFACTOR, complexity=3,
                          allowed_paths=["src/a/**", "src/b/**"])

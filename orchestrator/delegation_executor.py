@@ -86,32 +86,47 @@ class DelegationExecutor:
         await self._tel.record(
             parent_task_id,
             "delegation_started",
-            {"child_count": len(children)},
+            {
+                "child_count": len(children),
+                "decomposition_mode": (
+                    "explicit"
+                    if children and all(
+                        child.context.get("_decomposition_mode") == "explicit"
+                        for child in children
+                    )
+                    else "replicated_goal"
+                ),
+            },
         )
 
-        # ── Round 1: run all children concurrently ────────────────────────────
-        tasks = [
-            self._run_child(parent_task_id, child, budget)
-            for child in children
-        ]
-        executions: list[ChildExecution] = await asyncio.gather(*tasks)
-        result.children = list(executions)
-
-        # ── Round 2: retry failed children (once, independently) ─────────────
-        failed = result.failed_children()
-        if failed and budget.check_retries() is None:
-            budget.retries_used += 1
-            retry_tasks = [
-                self._run_child(parent_task_id, _child_for(c, children), budget, retry=True)
-                for c in failed
+        has_dependencies = any(child.context.get("_dependencies") for child in children)
+        if has_dependencies:
+            result.children = await self._execute_dag(parent_task_id, children, budget)
+        else:
+            # ── Round 1: run all independent children concurrently ────────────
+            tasks = [
+                self._run_child(parent_task_id, child, budget)
+                for child in children
             ]
-            retried: list[ChildExecution] = await asyncio.gather(*retry_tasks)
+            executions: list[ChildExecution] = await asyncio.gather(*tasks)
+            result.children = list(executions)
 
-            # Replace failed records with retry outcomes
-            id_map = {c.child_id: c for c in retried}
-            result.children = [
-                id_map.get(c.child_id, c) for c in result.children
-            ]
+            # ── Round 2: retry failed children (once, independently) ─────────
+            failed = result.failed_children()
+            if (
+                failed
+                and budget.check_retries() is None
+                and budget.can_submit_calls(1) is None
+            ):
+                budget.retries_used += 1
+                retry_tasks = [
+                    self._run_child(parent_task_id, _child_for(c, children), budget, retry=True)
+                    for c in failed
+                ]
+                retried: list[ChildExecution] = await asyncio.gather(*retry_tasks)
+
+                id_map = {c.child_id: c for c in retried}
+                result.children = [id_map.get(c.child_id, c) for c in result.children]
 
         # ── Aggregate ─────────────────────────────────────────────────────────
         result.finished_at_ms = int(time.monotonic() * 1000)
@@ -140,6 +155,83 @@ class DelegationExecutor:
         )
         return result
 
+    async def _execute_dag(
+        self,
+        parent_task_id: str,
+        children: list[TaskContract],
+        budget: BudgetState,
+    ) -> list[ChildExecution]:
+        """Execute explicit subtasks in dependency-respecting parallel waves."""
+        by_subtask = {
+            child.context.get("_subtask_id", child.context.get("_child_id", child.id)): child
+            for child in children
+        }
+        order = list(by_subtask)
+        pending = dict(by_subtask)
+        outcomes: dict[str, ChildExecution] = {}
+
+        while pending:
+            blocked = [
+                subtask_id
+                for subtask_id, child in pending.items()
+                if any(
+                    dependency in outcomes and not outcomes[dependency].succeeded
+                    for dependency in child.context.get("_dependencies", [])
+                )
+            ]
+            for subtask_id in blocked:
+                child = pending.pop(subtask_id)
+                outcomes[subtask_id] = ChildExecution(
+                    child_id=child.context.get("_child_id", child.id[:8]),
+                    run_id="<dependency>",
+                    status="failed",
+                )
+
+            ready_ids = [
+                subtask_id
+                for subtask_id, child in pending.items()
+                if all(
+                    dependency in outcomes and outcomes[dependency].succeeded
+                    for dependency in child.context.get("_dependencies", [])
+                )
+            ]
+            if not ready_ids:
+                # Contract validation prevents cycles; this is a fail-closed
+                # runtime guard for malformed externally constructed children.
+                for subtask_id, child in list(pending.items()):
+                    outcomes[subtask_id] = ChildExecution(
+                        child_id=child.context.get("_child_id", child.id[:8]),
+                        run_id="<dependency>",
+                        status="failed",
+                    )
+                    del pending[subtask_id]
+                break
+
+            wave_children = [pending.pop(subtask_id) for subtask_id in ready_ids]
+            wave_results = list(await asyncio.gather(*[
+                self._run_child(parent_task_id, child, budget)
+                for child in wave_children
+            ]))
+
+            failed_indexes = [index for index, execution in enumerate(wave_results) if not execution.succeeded]
+            if (
+                failed_indexes
+                and budget.check_retries() is None
+                and budget.can_submit_calls(1) is None
+            ):
+                budget.retries_used += 1
+                retried = await asyncio.gather(*[
+                    self._run_child(parent_task_id, wave_children[index], budget, retry=True)
+                    for index in failed_indexes
+                ])
+                for index, execution in zip(failed_indexes, retried, strict=True):
+                    wave_results[index] = execution
+
+            for subtask_id, execution in zip(ready_ids, wave_results, strict=True):
+                outcomes[subtask_id] = execution
+
+        return [outcomes[subtask_id] for subtask_id in order]
+
     # ── Private helpers ───────────────────────────────────────────────────────
 
     async def _run_child(
@@ -159,9 +251,23 @@ class DelegationExecutor:
             retry=retry,
         )
 
+        violation = budget.reserve_calls(1)
+        if violation:
+            return ChildExecution(
+                child_id=child_id,
+                run_id="<budget>",
+                status="failed",
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                retry_count=1 if retry else 0,
+            )
+
         try:
-            handle: RunHandle = await self._runtime.submit(task)
-            budget.calls_used += 1
+            try:
+                handle: RunHandle = await self._runtime.submit(task)
+            except Exception:
+                budget.release_reserved_call()
+                raise
+            budget.commit_reserved_call()
 
             await self._tel.record(
                 parent_task_id,
@@ -178,9 +284,7 @@ class DelegationExecutor:
                     event.payload,
                     handle.run_id,
                 )
-                if event.type == "usage":
-                    budget.calls_used += 1
-                elif event.type in ("completed", "error"):
+                if event.type in ("completed", "error"):
                     break
 
             agent_result: AgentResult = await self._runtime.wait(handle)

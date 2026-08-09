@@ -11,7 +11,11 @@ Task Profiler                ← token 估算 / 子任务数 / 模块数
    ↓
 Rule Router ── policies/default.yaml
    ├─ single                 ← 单 Agent
-   └─ delegation             ← 两个并行子 Agent
+   └─ delegation
+      ↓
+   Explicit Subtask Plan     ← 独立 goal / allowed_paths / dependencies / expected_output
+      ├─ 并行 wave
+      └─ DAG dependency wave
    ↓
 Budget Gate + Approval Gate  ← 硬限制 / 高风险人工确认
    ↓
@@ -19,7 +23,7 @@ Prompt Guard                 ← 把约束编码进 Agent prompt
    ↓
 Workspace Manager            ← Git Worktree 隔离（写代码任务）
    ↓
-Hermes Runtime Adapter       ← WebSocket TUI Gateway
+Hermes Runtime Adapter       ← WebSocket TUI Gateway（experimental，需 Phase 0 实机验证）
    ↓
 Deterministic Eval Gate      ← paths / budget / tests / secrets / lint
    ↓
@@ -63,6 +67,29 @@ aao run "Fix the null pointer in login handler" \
 aao stats
 ```
 
+### 显式子任务（真正拆分，而不是复制父 goal）
+
+```python
+from contracts.task import SubtaskSpec, TaskContract
+
+task = TaskContract(
+    goal="Audit auth and optimize database queries",
+    subtasks=[
+        SubtaskSpec(id="auth", goal="Audit authentication security", allowed_paths=["src/auth/**"]),
+        SubtaskSpec(
+            id="db",
+            goal="Profile and optimize database queries",
+            allowed_paths=["src/db/**"],
+            dependencies=["auth"],
+            expected_output="query profile plus verified patch",
+        ),
+    ],
+)
+```
+
+没有显式 `subtasks` 时，旧关键词 profiler 仍可触发 delegation，但会明确记录
+`decomposition_mode=replicated_goal`；它是兼容性降级，不再宣称为真实任务拆分。
+
 ### 4. 路由回测（CI 里也会自动跑）
 
 ```bash
@@ -70,7 +97,7 @@ aao eval-routing
 # Results: 15/15 passed  Policy: routing-v1.0
 ```
 
-### 5. 连接真实 Hermes（Phase 0 spike）
+### 5. 连接真实 Hermes（experimental / Phase 0 spike）
 
 先在本地启动 Hermes TUI Gateway，然后：
 
@@ -79,7 +106,7 @@ aao spike --url ws://localhost:4999
 # 输出兼容性报告到 spike/phase0_report.yaml
 ```
 
-如果 Phase 0 通过，把 `--mock` 去掉即可接入真实 Hermes：
+只有 Phase 0 在目标 Hermes 版本上通过后，才应把 `--mock` 去掉：
 
 ```bash
 aao run "Refactor auth module" \
@@ -149,7 +176,7 @@ aao stats                     # 任务统计 / token 用量 / eval 通过率
 ## 运行测试
 
 ```bash
-pytest tests/                 # 77 tests（含路由回归 15 cases）
+pytest tests/                 # 120 tests（含真实 Git worktree 交付/回滚）
 ruff check . --ignore E501,B008  # lint（应 0 errors）
 ```
 
@@ -160,9 +187,9 @@ ruff check . --ignore E501,B008  # lint（应 0 errors）
 | 功能 | V1 ✅ | V2 | V3 |
 |---|---|---|---|
 | Task Contract + Pydantic | ✅ | | |
-| Hermes Gateway Adapter | ✅ | | |
+| Hermes Gateway Adapter | experimental / Phase 0 | ✅（实机兼容门禁后） | |
 | Single Agent | ✅ | | |
-| Delegation (2 子 Agent) | ✅ | | |
+| Explicit Subtask + DAG Delegation | ✅ | | |
 | Rule Router + policy_version | ✅ | | |
 | Budget Gate | ✅ | | |
 | SQLite 状态持久化 | ✅ | | |

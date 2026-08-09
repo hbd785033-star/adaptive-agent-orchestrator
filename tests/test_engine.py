@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from adapters.mock import MockHermesAdapter
-from contracts.task import TaskContract, TaskType
+from contracts.task import SubtaskSpec, TaskContract, TaskType
 from orchestrator.engine import Orchestrator
 
 
@@ -65,6 +65,135 @@ worktree:
 
 class TestOrchestratorHappyPath:
     @pytest.mark.asyncio
+    async def test_delegation_delivers_worktree_artifacts_to_root_before_completed(self, tmp_path):
+        import os
+        import subprocess
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t.com",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t.com",
+        }
+        (repo / "README.md").write_text("base")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True, env=env)
+
+        policy = tmp_path / "delivery.yaml"
+        policy.write_text((tmp_path / "default.yaml").read_text() if (tmp_path / "default.yaml").exists() else "")
+        # build_orch writes its policy into tmp_path; use it once, then build a
+        # separate orchestrator whose repository root stays clean.
+        bootstrap = MockHermesAdapter()
+        bootstrap.enqueue_scenario("pass")
+        first = await build_orch(tmp_path, bootstrap)
+        await first.close()
+        policy.write_text((tmp_path / "default.yaml").read_text())
+
+        class WritingAdapter(MockHermesAdapter):
+            async def submit(self, task):
+                subtask_id = task.context["_subtask_id"]
+                artifact_dir = Path(task.workspace.path) / "artifacts"
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                (artifact_dir / f"{subtask_id}.txt").write_text(subtask_id)
+                return await super().submit(task)
+
+        adapter = WritingAdapter()
+        adapter.enqueue_scenario("pass", summary="auth")
+        adapter.enqueue_scenario("pass", summary="db")
+        orch = await Orchestrator.build(
+            runtime=adapter,
+            db_path=str(tmp_path / "delivery.db"),
+            repo_path=str(repo),
+            policy_path=str(policy),
+        )
+        task = TaskContract(
+            goal="deliver explicit work",
+            task_type=TaskType.MULTI_FILE_REFACTOR,
+            complexity=4,
+            allowed_paths=["artifacts/**"],
+            subtasks=[
+                SubtaskSpec(id="auth", goal="write auth", allowed_paths=["artifacts/**"]),
+                SubtaskSpec(id="db", goal="write db", allowed_paths=["artifacts/**"]),
+            ],
+        )
+
+        result = await orch.run(task)
+        records = list(orch._wm.list_records())
+        await orch.close()
+
+        assert result["outcome"] == "completed"
+        assert (repo / "artifacts" / "auth.txt").read_text() == "auth"
+        assert (repo / "artifacts" / "db.txt").read_text() == "db"
+        assert all(record.status.value == "cleaned" for record in records)
+
+    @pytest.mark.asyncio
+    async def test_integrated_eval_failure_rolls_root_back(self, tmp_path):
+        import os
+        import subprocess
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t.com",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t.com",
+        }
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "base"],
+            cwd=repo, check=True, capture_output=True, env=env,
+        )
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        bootstrap = MockHermesAdapter()
+        first = await build_orch(tmp_path, bootstrap)
+        await first.close()
+        policy = tmp_path / "default.yaml"
+
+        class WritingAdapter(MockHermesAdapter):
+            async def submit(self, task):
+                target = Path(task.workspace.path) / "outside" / "bad.txt"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("child-valid, parent-invalid")
+                return await super().submit(task)
+
+        adapter = WritingAdapter()
+        adapter.enqueue_scenario("pass")
+        orch = await Orchestrator.build(
+            runtime=adapter,
+            db_path=str(tmp_path / "rollback.db"),
+            repo_path=str(repo),
+            policy_path=str(policy),
+        )
+        task = TaskContract(
+            goal="attempt invalid integrated delivery",
+            task_type=TaskType.MULTI_FILE_REFACTOR,
+            complexity=4,
+            allowed_paths=["allowed/**"],
+            subtasks=[
+                SubtaskSpec(id="bad", goal="write outside parent scope", allowed_paths=["outside/**"]),
+            ],
+        )
+
+        result = await orch.run(task)
+        records = list(orch._wm.list_records())
+        await orch.close()
+        final_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        assert result["outcome"] == "failed"
+        assert final_sha == base_sha
+        assert not (repo / "outside" / "bad.txt").exists()
+        assert all(record.status.value == "abandoned" for record in records)
+
+    @pytest.mark.asyncio
     async def test_simple_task_completes(self, tmp_path):
         adapter = MockHermesAdapter()
         adapter.enqueue_scenario("pass", files_changed=["src/auth/login.py"], summary="fixed login")
@@ -88,7 +217,9 @@ class TestOrchestratorHappyPath:
         # Need a real git repo so WorkspaceManager can create worktrees
         import subprocess
         subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "init"],
+        (tmp_path / ".gitignore").write_text("default.yaml\ntest.db*\n.worktrees/\n")
+        subprocess.run(["git", "-C", str(tmp_path), "add", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "init"],
                        check=True, capture_output=True,
                        env={**__import__("os").environ,
                             "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t.com",

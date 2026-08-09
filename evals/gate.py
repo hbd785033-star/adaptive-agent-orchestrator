@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-from pathlib import Path
+import subprocess
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from contracts.evaluation import EvalCheck, EvalResult, EvalStatus
 from contracts.result import AgentResult
@@ -25,15 +26,88 @@ from orchestrator.budget import BudgetState
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
-def check_paths(result: AgentResult, task: TaskContract) -> EvalCheck:
+def _canonical_relative_path(raw_path: str, repo_path: Path) -> str | None:
+    """Return a safe POSIX relative path, or None when it escapes the repo."""
+    normalized = str(raw_path).replace("\\", "/")
+    posix_path = PurePosixPath(normalized)
+    if posix_path.is_absolute() or PureWindowsPath(raw_path).is_absolute():
+        return None
+    if any(part == ".." for part in posix_path.parts):
+        return None
+    parts = [part for part in posix_path.parts if part not in ("", ".")]
+    if not parts:
+        return None
+    root = repo_path.resolve()
+    candidate = root.joinpath(*parts).resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return "/".join(parts)
+
+
+def trusted_changed_files(
+    repo_path: str | Path,
+    base_sha: str | None = None,
+) -> list[str] | None:
+    """Derive changed paths from Git, including staged, unstaged and untracked."""
+    repo = Path(repo_path)
+
+    def _run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, check=False
+        )
+
+    probe = _run(["rev-parse", "--is-inside-work-tree"])
+    if probe.returncode != 0 or probe.stdout.strip() != b"true":
+        return None
+    diff = _run(["diff", "--name-only", "-z", base_sha or "HEAD"])
+    untracked = _run(["ls-files", "--others", "--exclude-standard", "-z"])
+    if diff.returncode != 0 or untracked.returncode != 0:
+        return None
+    names = [
+        value.decode(errors="surrogateescape")
+        for value in (diff.stdout + untracked.stdout).split(b"\0")
+        if value
+    ]
+    return list(dict.fromkeys(names))
+
+
+def check_paths(
+    result: AgentResult,
+    task: TaskContract,
+    *,
+    repo_path: str | Path = ".",
+) -> EvalCheck:
     """Verify changed files are all within allowed_paths."""
     if not task.allowed_paths:
         return EvalCheck(name="paths", status=EvalStatus.SKIP, detail="no allowed_paths defined", blocker=True)
 
+    repo = Path(repo_path)
+    safe_patterns = []
+    for pattern in task.allowed_paths:
+        normalized_pattern = str(pattern).replace("\\", "/")
+        path_pattern = PurePosixPath(normalized_pattern)
+        if (
+            path_pattern.is_absolute()
+            or PureWindowsPath(pattern).is_absolute()
+            or ".." in path_pattern.parts
+        ):
+            return EvalCheck(
+                name="paths",
+                status=EvalStatus.FAIL,
+                detail=f"unsafe allowed_paths pattern: {pattern}",
+                blocker=True,
+            )
+        safe_patterns.append(normalized_pattern)
+
     violations = []
-    for f in result.files_changed:
-        if not any(fnmatch.fnmatch(f, pattern) for pattern in task.allowed_paths):
-            violations.append(f)
+    for raw_file in result.files_changed:
+        safe_file = _canonical_relative_path(raw_file, repo)
+        if safe_file is None or not any(
+            fnmatch.fnmatch(safe_file, pattern) for pattern in safe_patterns
+        ):
+            violations.append(raw_file)
 
     if violations:
         return EvalCheck(
@@ -47,7 +121,7 @@ def check_paths(result: AgentResult, task: TaskContract) -> EvalCheck:
 
 def check_budget(result: AgentResult, budget: BudgetState) -> EvalCheck:
     """Verify token usage did not exceed budget limits."""
-    violation = budget.check_calls()
+    violation = budget.is_over_budget()
     if violation:
         return EvalCheck(
             name="budget",
@@ -156,8 +230,11 @@ async def check_secrets(repo_path: str | Path, changed_files: list[str]) -> Eval
         r"ghp_[a-zA-Z0-9]{36}",
     ]
     for f in changed_files:
+        safe_file = _canonical_relative_path(f, Path(repo_path))
+        if safe_file is None:
+            continue
         try:
-            content = Path(repo_path, f).read_text(errors="replace")
+            content = Path(repo_path, safe_file).read_text(errors="replace")
             for pattern in PATTERNS:
                 if re.search(pattern, content):
                     return EvalCheck(
@@ -194,14 +271,20 @@ class DeterministicEvalGate:
     ) -> EvalResult:
         checks: list[EvalCheck] = []
 
+        effective_repo = Path(task.workspace.path) if task.workspace else self._repo
+        base_sha = task.context.get("_eval_base_sha")
+        git_changed = trusted_changed_files(effective_repo, base_sha=base_sha)
+        changed_files = git_changed if git_changed is not None else result.files_changed
+        trusted_result = result.model_copy(update={"files_changed": changed_files})
+
         # Synchronous checks
-        checks.append(check_paths(result, task))
+        checks.append(check_paths(trusted_result, task, repo_path=effective_repo))
         checks.append(check_budget(result, budget))
 
         # Async checks (run in parallel)
-        lint_task = asyncio.create_task(check_lint(self._repo, result.files_changed))
-        tests_task = asyncio.create_task(check_tests(self._repo, result.files_changed))
-        secrets_task = asyncio.create_task(check_secrets(self._repo, result.files_changed))
+        lint_task = asyncio.create_task(check_lint(effective_repo, changed_files))
+        tests_task = asyncio.create_task(check_tests(effective_repo, changed_files))
+        secrets_task = asyncio.create_task(check_secrets(effective_repo, changed_files))
 
         checks.extend(await asyncio.gather(lint_task, tests_task, secrets_task))
 

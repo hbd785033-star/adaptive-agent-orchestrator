@@ -32,6 +32,15 @@ class WorkspaceSpec(BaseModel):
     repo_path: str | None = None        # root repo; optional, for reference only
 
 
+class SubtaskSpec(BaseModel):
+    """Explicit, independently executable unit supplied by a caller or planner."""
+    id: str
+    goal: str
+    allowed_paths: list[str] = Field(default_factory=list)
+    dependencies: list[str] = Field(default_factory=list)
+    expected_output: str = ""
+
+
 class TaskContract(BaseModel):
     """
     Immutable specification for one unit of work.
@@ -63,11 +72,50 @@ class TaskContract(BaseModel):
 
     # --- metadata ---
     parent_task_id: str | None = None
+    subtasks: list[SubtaskSpec] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_high_risk_has_criteria(self) -> TaskContract:
         if self.risk >= RiskLevel.HIGH and not self.success_criteria:
             raise ValueError("High-risk tasks must define success_criteria")
+        return self
+
+    @model_validator(mode="after")
+    def validate_subtask_plan(self) -> TaskContract:
+        if not self.subtasks:
+            return self
+        ids = [subtask.id for subtask in self.subtasks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("subtasks must have unique ids")
+        goals = [" ".join(subtask.goal.casefold().split()) for subtask in self.subtasks]
+        if len(goals) != len(set(goals)):
+            raise ValueError("subtasks must have unique goals")
+        known = set(ids)
+        graph: dict[str, list[str]] = {}
+        for subtask in self.subtasks:
+            unknown = set(subtask.dependencies) - known
+            if unknown:
+                raise ValueError(f"subtask {subtask.id} has unknown dependencies: {sorted(unknown)}")
+            if subtask.id in subtask.dependencies:
+                raise ValueError("subtask dependency cycle detected")
+            graph[subtask.id] = subtask.dependencies
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node: str) -> None:
+            if node in visiting:
+                raise ValueError("subtask dependency cycle detected")
+            if node in visited:
+                return
+            visiting.add(node)
+            for dependency in graph[node]:
+                visit(dependency)
+            visiting.remove(node)
+            visited.add(node)
+
+        for node in graph:
+            visit(node)
         return self
 
     def prompt_preamble(self) -> str:
@@ -90,8 +138,8 @@ class TaskContract(BaseModel):
             lines.append("- Success criteria:")
             for c in self.success_criteria:
                 lines.append(f"  - {c}")
-        if self.workspace and self.workspace.worktree_path:
-            lines.append(f"- Working directory: {self.workspace.worktree_path}")
+        if self.workspace:
+            lines.append(f"- Working directory: {self.workspace.path}")
             lines.append(f"- Branch: {self.workspace.branch}")
         lines.append("")
         lines.append("## Additional context")

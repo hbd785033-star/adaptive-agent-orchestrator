@@ -21,7 +21,7 @@ import pytest
 
 from adapters.mock import MockHermesAdapter
 from contracts.delegation import ChildExecution, DelegationResult
-from contracts.task import TaskContract, TaskType
+from contracts.task import SubtaskSpec, TaskContract, TaskType
 from evals.gate import DeterministicEvalGate
 from orchestrator.budget import BudgetConfig, BudgetState
 from orchestrator.delegation_executor import DelegationExecutor
@@ -50,20 +50,17 @@ def make_children(n: int, **scenario_kwargs) -> tuple[MockHermesAdapter, list[Ta
 
 
 async def build_executor(adapter, tmp_path) -> DelegationExecutor:
-    from storage.database import Database
-    db = Database(tmp_path / "test.db")
-    await db.connect()
     return DelegationExecutor(
         runtime=adapter,
         eval_gate=DeterministicEvalGate(str(tmp_path)),
-        telemetry=TelemetryRecorder(db),
+        telemetry=TelemetryRecorder(),
     )
 
 
-def make_budget(max_retries: int = 1) -> BudgetState:
+def make_budget(max_retries: int = 1, max_calls: int = 8) -> BudgetState:
     return BudgetState(
         task_id="test-parent",
-        config=BudgetConfig(max_retries=max_retries),
+        config=BudgetConfig(max_retries=max_retries, max_total_calls=max_calls),
     )
 
 
@@ -81,6 +78,19 @@ class TestTwoDistinctRunIds:
         assert len(dr.children) == 2
         run_ids = {c.run_id for c in dr.children}
         assert len(run_ids) == 2, "Each child must have a unique run_id"
+
+    @pytest.mark.asyncio
+    async def test_parallel_children_cannot_oversubscribe_call_budget(self, tmp_path):
+        adapter, children = make_children(2, summary="done")
+        executor = await build_executor(adapter, tmp_path)
+
+        result = await executor.execute(
+            "parent-budget", children, make_budget(max_retries=0, max_calls=1)
+        )
+
+        assert len(adapter._runs) == 1
+        assert result.successful == 1
+        assert result.failed == 1
 
 
 # ── Test 2: true concurrency ──────────────────────────────────────────────────
@@ -120,6 +130,53 @@ class TestTrueConcurrency:
         # We just verify both completed — concurrency is guaranteed by asyncio.gather
         assert all(c.status == "completed" for c in dr.children)
         assert elapsed < 5.0  # sanity: shouldn't take more than 5s
+
+
+class TestDependencyScheduling:
+    @pytest.mark.asyncio
+    async def test_explicit_dependency_runs_after_its_prerequisite(self, tmp_path):
+        class OrderedAdapter(MockHermesAdapter):
+            def __init__(self):
+                super().__init__()
+                self.submitted_subtasks = []
+                self.run_subtasks = {}
+                self.auth_completed = False
+                self.db_started_early = False
+
+            async def submit(self, task):
+                subtask_id = task.context.get("_subtask_id")
+                self.submitted_subtasks.append(subtask_id)
+                if subtask_id == "db" and not self.auth_completed:
+                    self.db_started_early = True
+                handle = await super().submit(task)
+                self.run_subtasks[handle.run_id] = subtask_id
+                return handle
+
+            async def wait(self, handle):
+                result = await super().wait(handle)
+                if self.run_subtasks[handle.run_id] == "auth":
+                    self.auth_completed = True
+                return result
+
+        from orchestrator.prompt_guard import split_for_delegation
+
+        adapter = OrderedAdapter()
+        adapter.enqueue_scenario("pass", summary="auth done")
+        adapter.enqueue_scenario("pass", summary="db done")
+        parent = make_task(subtasks=[
+            SubtaskSpec(id="auth", goal="Audit auth"),
+            SubtaskSpec(id="db", goal="Optimize db", dependencies=["auth"]),
+        ])
+        children = split_for_delegation(
+            parent, [("child-1", None), ("child-2", None)]
+        )
+        executor = await build_executor(adapter, tmp_path)
+
+        result = await executor.execute("parent-dag", children, make_budget())
+
+        assert result.successful == 2
+        assert adapter.submitted_subtasks == ["auth", "db"]
+        assert adapter.db_started_early is False
 
 
 # ── Test 3: independent usage per child ──────────────────────────────────────

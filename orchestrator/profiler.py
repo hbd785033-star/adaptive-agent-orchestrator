@@ -75,17 +75,22 @@ class TaskProfiler:
         # Token estimate
         estimated_tokens = estimate_input_tokens(task)
 
-        # Parallel signals
-        parallel_hits = sum(
-            1 for pattern in _PARALLEL_SIGNALS
-            if re.search(pattern, goal_lower)
-        )
-        # Heuristic: each parallel signal → +1 subtask (minimum 1)
-        independent_count = max(1, parallel_hits + (1 if parallel_hits else 0))
+        # Explicit plans are authoritative. Heuristics only estimate cardinality
+        # when the caller did not provide concrete subtask goals.
+        if task.subtasks:
+            independent_count = len(task.subtasks)
+        else:
+            parallel_hits = sum(
+                1 for pattern in _PARALLEL_SIGNALS
+                if re.search(pattern, goal_lower)
+            )
+            independent_count = max(1, parallel_hits + (1 if parallel_hits else 0))
 
         # Sequential dependency — overrides parallel signals
-        has_sequential = any(
-            re.search(p, goal_lower) for p in _SEQUENTIAL_SIGNALS
+        has_sequential = bool(
+            any(subtask.dependencies for subtask in task.subtasks)
+            if task.subtasks
+            else any(re.search(p, goal_lower) for p in _SEQUENTIAL_SIGNALS)
         )
 
         # Module count from allowed_paths

@@ -193,6 +193,13 @@ class Orchestrator:
             decision.route == "delegation"
             and profile.independent_subtask_count > budget.config.max_children
         ):
+            if task.subtasks:
+                detail = (
+                    f"explicit subtasks={len(task.subtasks)} exceed "
+                    f"max_children={budget.config.max_children}"
+                )
+                await record.mark_abandoned(detail)
+                return self._summary(record, "abandoned", detail)
             log.warning(
                 "subtask_count_exceeds_budget",
                 task_id=task.id,
@@ -229,9 +236,17 @@ class Orchestrator:
         guarded_task = inject_constraints(task)
 
         # 6. Submit
-        handle = await self._runtime.submit(guarded_task)
+        violation = budget.reserve_calls(1)
+        if violation:
+            await record.mark_abandoned(f"budget: {violation.detail}")
+            return self._summary(record, "abandoned", violation.detail)
+        try:
+            handle = await self._runtime.submit(guarded_task)
+        except Exception:
+            budget.release_reserved_call()
+            raise
+        budget.commit_reserved_call()
         await record.mark_running(handle.run_id)
-        budget.calls_used += 1
         await self._tel.record(
             task.id, "task_submitted", {"run_id": handle.run_id}, handle.run_id
         )
@@ -250,9 +265,6 @@ class Orchestrator:
                     await self._runtime.cancel(handle)
                     await record.mark_failed("approval denied mid-run")
                     return self._summary(record, "failed", "approval denied")
-
-            elif event.type == "usage":
-                budget.calls_used += 1
 
             elif event.type in ("completed", "error"):
                 break
@@ -327,14 +339,20 @@ class Orchestrator:
         decision,
     ) -> dict:
         # 5. Workspace allocation (write tasks only)
-        worktrees: list[tuple[str, Path]] = []
+        child_count = len(task.subtasks) if task.subtasks else budget.config.max_children
+        worktrees: list[tuple[str, Path | None]] = []
+        integration_base: str | None = None
         if (
             self._wm
             and self._wm.needs_worktree(task.task_type.value)
         ):
-            for i in range(budget.config.max_children):
+            self._wm.ensure_root_clean()
+            integration_base = self._wm.current_head()
+            task.context["_eval_base_sha"] = integration_base
+            for i in range(child_count):
                 child_id = f"child-{i+1}"
                 wt = self._wm.allocate(task.id, child_id)
+                self._wm.activate(task.id, child_id)
                 worktrees.append((child_id, wt.worktree_path))
                 log.info(
                     "worktree_allocated",
@@ -343,23 +361,14 @@ class Orchestrator:
                     worktree_path=str(wt.worktree_path),
                 )
 
-        # 6. Prompt Guard — produce one contract per child
-        if worktrees:
-            child_contracts = split_for_delegation(task, worktrees)
-        else:
-            # No worktrees (read-only delegation) — create N copies with child_id injected
-            child_contracts = []
-            for i in range(budget.config.max_children):
-                child_id = f"child-{i+1}"
-                from copy import deepcopy
-                child = inject_constraints(deepcopy(task))
-                child.context["_child_id"] = child_id
-                child_contracts.append(child)
+        # 6. Prompt Guard — produce one contract per child. Read-only children
+        # still use the same splitter so explicit subtask goals are preserved.
+        if not worktrees:
+            worktrees = [(f"child-{i+1}", None) for i in range(child_count)]
+        child_contracts = split_for_delegation(task, worktrees)
 
         # 7. Mark running (using sentinel run_id for delegation parent)
         await record.mark_running(f"delegation:{task.id}")
-        budget.calls_used += 1
-
         # 8. Execute children concurrently via DelegationExecutor
         delegation_result: DelegationResult = await self._delegation_executor.execute(
             parent_task_id=task.id,
@@ -392,20 +401,49 @@ class Orchestrator:
         )
 
         if status == "completed":
+            if self._wm and integration_base is not None:
+                records = [
+                    wt_record for wt_record in self._wm.list_records()
+                    if wt_record.task_id == task.id
+                ]
+                try:
+                    for wt_record in records:
+                        self._wm.commit_changes(task.id, wt_record.child_id)
+                        self._wm.integrate(task.id, wt_record.child_id)
+
+                    aggregate = delegation_result.aggregate_result
+                    if aggregate is None:
+                        raise RuntimeError("delegation produced no aggregate result")
+                    integrated_eval = await self._eval_gate.run(task, aggregate, budget)
+                    if integrated_eval.overall != EvalStatus.PASS:
+                        failed = ", ".join(
+                            check.name for check in integrated_eval.failed_checks()
+                        )
+                        raise RuntimeError(f"integrated eval failed: {failed}")
+                except Exception as exc:
+                    self._wm.rollback(integration_base)
+                    for wt_record in records:
+                        self._wm.abandon(task.id, wt_record.child_id)
+                    await record.mark_failed("integration_failed")
+                    return self._summary_delegation(
+                        record, delegation_result, detail=str(exc), outcome="failed"
+                    )
+                for wt_record in records:
+                    self._wm.clean(task.id, wt_record.child_id)
+
             await record.mark_completed()
-            if self._wm:
-                for wt_record in list(self._wm.list_records()):
-                    if wt_record.task_id == task.id:
-                        self._wm.mark_merging(task.id, wt_record.child_id)
             return self._summary_delegation(record, delegation_result)
 
         if status == "partial_failed":
-            # Partial failure — deliver with warning, human can decide
-            await record.mark_completed()
+            if self._wm:
+                for wt_record in list(self._wm.list_records()):
+                    if wt_record.task_id == task.id:
+                        self._wm.abandon(task.id, wt_record.child_id)
+            await record.mark_failed("partial_children_failed")
             return self._summary_delegation(
                 record,
                 delegation_result,
-                detail=f"{delegation_result.failed} of {len(delegation_result.children)} children failed",
+                detail=f"{delegation_result.failed} of {len(delegation_result.children)} children failed; nothing integrated",
             )
 
         # All failed
@@ -452,10 +490,11 @@ class Orchestrator:
         record: TaskRecord,
         dr: DelegationResult,
         detail: str = "",
+        outcome: str | None = None,
     ) -> dict:
         return {
             "task_id": record.task.id,
-            "outcome": dr.overall_status,
+            "outcome": outcome or dr.overall_status,
             "route": "delegation",
             "retry_count": record.retry_count,
             "detail": detail,
