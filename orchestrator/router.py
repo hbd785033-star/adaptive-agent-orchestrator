@@ -102,6 +102,14 @@ class RuleRouter:
 
         # ── Hard single rules (checked first) ────────────────────────────────
 
+        # An explicit, validated subtask plan is an execution plan rather than a
+        # profiler hint. Dependency edges are handled by the DAG scheduler.
+        if task.subtasks:
+            reasons.append(f"explicit_subtasks={len(task.subtasks)} → delegation")
+            if has_sequential_dependency:
+                reasons.append("dependency_edges=true → scheduled in DAG waves")
+            return RoutingDecision("delegation", reasons, self._policy_version)
+
         if self._sequential_dep_forces_single and has_sequential_dependency:
             reasons.append("sequential_dependency=true → forces single")
             return RoutingDecision("single", reasons, self._policy_version)

@@ -35,6 +35,7 @@ class BudgetState:
     children_used: int = 0
     retries_used: int = 0
     calls_used: int = 0
+    calls_reserved: int = 0
     depth_used: int = 0
 
     def check_children(self) -> BudgetViolation | None:
@@ -53,13 +54,48 @@ class BudgetState:
             )
         return None
 
-    def check_calls(self) -> BudgetViolation | None:
-        if self.calls_used >= self.config.max_total_calls:
+    def can_submit_calls(self, count: int = 1) -> BudgetViolation | None:
+        """Preflight check: would starting ``count`` calls exceed the limit?"""
+        projected = self.calls_used + self.calls_reserved + count
+        if count < 1:
+            raise ValueError("count must be positive")
+        if projected > self.config.max_total_calls:
             return BudgetViolation(
                 "max_total_calls",
-                f"calls={self.calls_used} >= limit={self.config.max_total_calls}",
+                f"calls={self.calls_used} reserved={self.calls_reserved} requested={count} "
+                f"> limit={self.config.max_total_calls}",
             )
         return None
+
+    def reserve_calls(self, count: int = 1) -> BudgetViolation | None:
+        violation = self.can_submit_calls(count)
+        if violation is None:
+            self.calls_reserved += count
+        return violation
+
+    def commit_reserved_call(self) -> None:
+        if self.calls_reserved < 1:
+            raise RuntimeError("no reserved call to commit")
+        self.calls_reserved -= 1
+        self.calls_used += 1
+
+    def release_reserved_call(self) -> None:
+        if self.calls_reserved < 1:
+            raise RuntimeError("no reserved call to release")
+        self.calls_reserved -= 1
+
+    def is_over_budget(self) -> BudgetViolation | None:
+        """Postflight invariant: using exactly the limit is valid."""
+        if self.calls_used > self.config.max_total_calls:
+            return BudgetViolation(
+                "max_total_calls",
+                f"calls={self.calls_used} > limit={self.config.max_total_calls}",
+            )
+        return None
+
+    def check_calls(self) -> BudgetViolation | None:
+        """Backward-compatible preflight alias."""
+        return self.can_submit_calls(1)
 
     def needs_approval_for_calls(self) -> bool:
         return self.calls_used >= self.config.require_approval_above_calls

@@ -35,17 +35,20 @@ def estimate_cost(
 ) -> float:
     """Return estimated USD cost (never negative; rounds to 6 decimal places)."""
     # Normalise model name: lowercase, strip date suffixes like -20250101
-    key = model.lower().split(":")[0]          # strip provider prefix if any
+    raw_key = model.lower()
+    key = raw_key.split(":", 1)[-1] if ":" in raw_key else raw_key
     key = "-".join(                             # drop pure-digit trailing parts
         p for p in key.split("-") if not p.isdigit()
     )
     # Partial key match: pick first entry whose key is contained in model name
     price_in, price_out = _PRICE_TABLE.get("__default__")
-    for table_key, prices in _PRICE_TABLE.items():
-        if table_key == "__default__":
-            continue
+    for table_key in sorted(
+        (name for name in _PRICE_TABLE if name != "__default__"),
+        key=len,
+        reverse=True,
+    ):
         if table_key in key or key in table_key:
-            price_in, price_out = prices
+            price_in, price_out = _PRICE_TABLE[table_key]
             break
 
     usd = (input_tokens * price_in + output_tokens * price_out) / 1_000_000

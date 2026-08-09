@@ -64,6 +64,25 @@ class WorkspaceManager:
         self._base: Path = self._repo / wt_cfg.get("base_path", ".worktrees")
         self._readonly_types: set[str] = set(wt_cfg.get("readonly_task_types", []))
         self._records: dict[tuple[str, str], WorktreeRecord] = {}
+        self._exclude_internal_worktrees()
+
+    @property
+    def repo_path(self) -> Path:
+        return self._repo
+
+    def _exclude_internal_worktrees(self) -> None:
+        """Keep internal worktrees out of trusted root changed-file scans."""
+        try:
+            relative = self._base.resolve().relative_to(self._repo.resolve())
+        except ValueError:
+            return
+        exclude_file = self._repo / ".git" / "info" / "exclude"
+        if not exclude_file.parent.exists():
+            return
+        pattern = f"/{relative.as_posix().rstrip('/')}/"
+        existing = exclude_file.read_text(errors="ignore") if exclude_file.exists() else ""
+        if pattern not in existing.splitlines():
+            exclude_file.write_text(existing.rstrip("\n") + f"\n{pattern}\n")
 
     def needs_worktree(self, task_type: str) -> bool:
         return task_type not in self._readonly_types
@@ -113,6 +132,58 @@ class WorkspaceManager:
 
     def mark_merging(self, task_id: str, child_id: str) -> None:
         self._get(task_id, child_id).status = WorktreeStatus.MERGING
+
+    def current_head(self) -> str:
+        """Return the root repository HEAD used as the integration baseline."""
+        return _git(self._repo, ["rev-parse", "HEAD"]).strip()
+
+    def ensure_root_clean(self) -> None:
+        """Refuse delivery when any non-ignored root change could be overwritten."""
+        dirty = _git(self._repo, ["status", "--porcelain", "--untracked-files=all"])
+        if dirty.strip():
+            raise RuntimeError("root repository has tracked or untracked changes")
+
+    def rollback(self, base_sha: str) -> None:
+        """Atomically return the clean root to its pre-integration commit."""
+        with contextlib.suppress(RuntimeError):
+            _git(self._repo, ["merge", "--abort"])
+        _git(self._repo, ["reset", "--hard", base_sha])
+
+    def commit_changes(self, task_id: str, child_id: str) -> str:
+        """Commit all child worktree changes and return the child branch tip."""
+        record = self._get(task_id, child_id)
+        status = _git(record.worktree_path, ["status", "--porcelain"])
+        if status.strip():
+            _git(record.worktree_path, ["add", "-A"])
+            _git(
+                record.worktree_path,
+                [
+                    "-c", "user.name=Adaptive Agent Orchestrator",
+                    "-c", "user.email=adaptive-agent-orchestrator@users.noreply.github.com",
+                    "commit", "-m", f"agent({record.child_id}): deliver {record.task_id}",
+                ],
+            )
+        return _git(record.worktree_path, ["rev-parse", "HEAD"]).strip()
+
+    def integrate(self, task_id: str, child_id: str) -> None:
+        """Merge a validated child branch into the root repository."""
+        record = self._get(task_id, child_id)
+        record.status = WorktreeStatus.MERGING
+        try:
+            _git(
+                self._repo,
+                [
+                    "-c", "user.name=Adaptive Agent Orchestrator",
+                    "-c", "user.email=adaptive-agent-orchestrator@users.noreply.github.com",
+                    "merge", "--no-ff", record.branch,
+                    "-m", f"integrate {record.task_id}/{record.child_id}",
+                ],
+            )
+        except RuntimeError:
+            with contextlib.suppress(RuntimeError):
+                _git(self._repo, ["merge", "--abort"])
+            record.status = WorktreeStatus.ABANDONED
+            raise
 
     def abandon(self, task_id: str, child_id: str) -> None:
         """Eval failed — keep worktree intact for human inspection."""
