@@ -21,11 +21,12 @@ from contracts.task import TaskContract
 from evals.gate import DeterministicEvalGate
 from orchestrator.budget import ApprovalGate, BudgetConfig, BudgetState
 from orchestrator.delegation_executor import DelegationExecutor
+from orchestrator.execution_policy import ExecutionPolicy
 from orchestrator.profiler import TaskProfiler
 from orchestrator.prompt_guard import inject_constraints, split_for_delegation
 from orchestrator.router import RuleRouter
 from orchestrator.state_machine import StateMachine, TaskRecord, TaskStatus
-from orchestrator.workspace import WorkspaceManager
+from orchestrator.workspace import ExecutionWorkspace, WorkspaceManager
 from storage.database import Database
 from telemetry.events import TelemetryRecorder
 
@@ -62,6 +63,11 @@ class Orchestrator:
         self._router = router
         self._budget_config = budget_config
         self._approval = approval_gate
+        self._execution_policy = ExecutionPolicy(
+            always_require_actions=set(getattr(approval_gate, "_always_require", set())),
+            require_approval_above_calls=budget_config.require_approval_above_calls,
+            max_total_calls=budget_config.max_total_calls,
+        )
         self._eval_gate = eval_gate
         self._wm = workspace_manager
         self._tel = telemetry
@@ -69,6 +75,7 @@ class Orchestrator:
             runtime=runtime,
             eval_gate=eval_gate,
             telemetry=telemetry,
+            execution_policy=self._execution_policy,
         )
 
     @classmethod
@@ -97,9 +104,19 @@ class Orchestrator:
         workspace_manager: WorkspaceManager | None = None
         if Path(repo_path).exists():
             try:
-                workspace_manager = WorkspaceManager(
-                    repo_path=repo_path, policy_path=policy_path
+                import subprocess
+
+                probe = subprocess.run(
+                    ["git", "rev-parse", "--is-inside-work-tree"],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
+                if probe.returncode == 0 and probe.stdout.strip() == "true":
+                    workspace_manager = WorkspaceManager(
+                        repo_path=repo_path, policy_path=policy_path
+                    )
             except Exception:
                 log.warning("workspace_manager_init_failed", repo_path=repo_path)
 
@@ -232,8 +249,25 @@ class Orchestrator:
         decision,
         is_retry: bool,
     ) -> dict:
-        # 5. Prompt Guard
-        guarded_task = inject_constraints(task)
+        # 5. Every single write uses the same isolated execution workspace
+        # contract as a delegated child. The root is touched only after PASS.
+        workspace: ExecutionWorkspace | None = None
+        needs_workspace = not self._wm or self._wm.needs_worktree(task.task_type.value)
+        if needs_workspace and self._wm is None:
+            await record.mark_failed("workspace unavailable for write task")
+            return self._summary(record, "failed", "workspace unavailable for write task")
+        if self._wm and self._wm.needs_worktree(task.task_type.value):
+            workspace = ExecutionWorkspace.create(
+                self._wm.repo_path,
+                task_id=task.id,
+                execution_id=f"single-{record.retry_count}",
+            )
+            task = task.model_copy(
+                update={"context": {**task.context, "_eval_base_sha": workspace.base_sha}}
+            )
+            guarded_task = inject_constraints(task, workspace.path, workspace.execution_id)
+        else:
+            guarded_task = inject_constraints(task)
 
         # 6. Submit
         violation = budget.reserve_calls(1)
@@ -244,6 +278,8 @@ class Orchestrator:
             handle = await self._runtime.submit(guarded_task)
         except Exception:
             budget.release_reserved_call()
+            if workspace:
+                workspace.rollback()
             raise
         budget.commit_reserved_call()
         await record.mark_running(handle.run_id)
@@ -258,11 +294,18 @@ class Orchestrator:
             )
 
             if event.type == "approval_request":
-                approved = self._approval.prompt_user(
-                    event.payload.get("reason", "agent requested approval"), task
+                reason = event.payload.get("reason", "agent requested approval")
+                approved = self._approval.prompt_user(reason, task)
+                decision = self._execution_policy.authorize_event(
+                    task,
+                    event.payload,
+                    calls_used=max(0, budget.calls_used - 1),
+                    approval=approved,
                 )
-                if not approved:
+                if not decision.allowed:
                     await self._runtime.cancel(handle)
+                    if workspace:
+                        workspace.rollback()
                     await record.mark_failed("approval denied mid-run")
                     return self._summary(record, "failed", "approval denied")
 
@@ -273,6 +316,8 @@ class Orchestrator:
         agent_result = await self._runtime.wait(handle)
 
         if agent_result.status == RunStatus.FAILED:
+            if workspace:
+                workspace.rollback()
             await record.mark_failed(agent_result.error or "agent reported failure")
             return self._summary(record, "failed", agent_result.error or "agent error")
 
@@ -287,7 +332,12 @@ class Orchestrator:
 
         # 9. Eval gate
         await record.mark_evaluating()
-        eval_result = await self._eval_gate.run(task, agent_result, budget)
+        try:
+            eval_result = await self._eval_gate.run(guarded_task, agent_result, budget)
+        except Exception:
+            if workspace:
+                workspace.rollback()
+            raise
         await self._db.append_eval_result(
             task.id,
             handle.run_id,
@@ -306,12 +356,28 @@ class Orchestrator:
 
         # 10. Outcome
         if eval_result.overall == EvalStatus.PASS:
+            trusted_files = workspace.changed_files() if workspace else []
+            if workspace:
+                try:
+                    workspace.integrate()
+                except Exception as exc:
+                    await record.mark_failed("integration_failed")
+                    return self._summary(record, "failed", str(exc), eval_result=eval_result)
             await record.mark_completed()
             return self._summary(
-                record, "completed", "", eval_result=eval_result, usage=usage
+                record,
+                "completed",
+                "",
+                eval_result=eval_result,
+                usage=usage,
+                files_changed=trusted_files,
+                workspace_root=str(workspace.path) if workspace else None,
+                isolation_level="workspace" if workspace else "none",
             )
 
         # Eval failed — retry once if budget allows
+        if workspace:
+            workspace.rollback()
         retry_violation = budget.check_retries()
         if not retry_violation:
             await record.mark_failed("eval_failed")
@@ -464,6 +530,7 @@ class Orchestrator:
     ) -> dict:
         d: dict = {
             "task_id": record.task.id,
+            "run_id": record.run_id,
             "outcome": outcome,
             "route": record.route,
             "retry_count": record.retry_count,
@@ -483,6 +550,9 @@ class Orchestrator:
                 "total_tokens": u.total_tokens,
                 "estimated_cost_usd": u.estimated_cost_usd,
             }
+        for name in ("files_changed", "workspace_root", "isolation_level"):
+            if name in extra:
+                d[name] = extra[name]
         return d
 
     @staticmethod

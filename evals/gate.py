@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from contracts.evaluation import EvalCheck, EvalResult, EvalStatus
 from contracts.result import AgentResult
 from contracts.task import TaskContract
+from evals.verifier import CriterionVerifier
 from orchestrator.budget import BudgetState
 
 # ── Individual checks ─────────────────────────────────────────────────────────
@@ -133,6 +134,40 @@ def check_budget(result: AgentResult, budget: BudgetState) -> EvalCheck:
         name="budget",
         status=EvalStatus.PASS,
         detail=f"calls={budget.calls_used}/{budget.config.max_total_calls}",
+    )
+
+
+def check_read_only(changed_files: list[str], task: TaskContract) -> EvalCheck:
+    """A read-only contract fails on any trusted Git diff."""
+    from contracts.task import TaskType
+
+    readonly = task.task_type in {TaskType.CODE_REVIEW, TaskType.PARALLEL_RESEARCH}
+    if not readonly:
+        return EvalCheck(name="read_only", status=EvalStatus.SKIP, detail="write task")
+    if changed_files:
+        return EvalCheck(
+            name="read_only",
+            status=EvalStatus.FAIL,
+            detail=f"read-only task changed files: {changed_files}",
+            blocker=True,
+        )
+    return EvalCheck(name="read_only", status=EvalStatus.PASS, detail="no repository changes")
+
+
+def check_success_criteria(repo_path: Path, task: TaskContract, completed: bool) -> EvalCheck:
+    """Structured criteria are executable evidence; completion alone never passes them."""
+    from contracts.execution import SuccessCriterion
+
+    criteria = [item for item in task.success_criteria if isinstance(item, SuccessCriterion)]
+    if not criteria:
+        return EvalCheck(name="success_criteria", status=EvalStatus.SKIP, detail="no structured criteria")
+    outcome = CriterionVerifier(repo_path).verify(criteria, completed=completed)
+    failed = [item.detail for item in outcome.criteria if not item.passed]
+    return EvalCheck(
+        name="success_criteria",
+        status=EvalStatus.PASS if outcome.passed else EvalStatus.FAIL,
+        detail="all criteria passed" if outcome.passed else f"failed criteria: {failed}",
+        blocker=True,
     )
 
 
@@ -280,6 +315,10 @@ class DeterministicEvalGate:
         # Synchronous checks
         checks.append(check_paths(trusted_result, task, repo_path=effective_repo))
         checks.append(check_budget(result, budget))
+        checks.append(check_read_only(changed_files, task))
+        checks.append(check_success_criteria(
+            effective_repo, task, completed=result.status.value == "completed"
+        ))
 
         # Async checks (run in parallel)
         lint_task = asyncio.create_task(check_lint(effective_repo, changed_files))

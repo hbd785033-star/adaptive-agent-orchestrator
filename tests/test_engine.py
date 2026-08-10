@@ -18,6 +18,23 @@ from orchestrator.engine import Orchestrator
 
 async def build_orch(tmp_path: Path, runtime) -> Orchestrator:
     """Helper: build Orchestrator pointed at a temp DB and tmp policy."""
+    import os
+    import subprocess
+
+    if not (tmp_path / ".git").exists():
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+        (tmp_path / ".gitignore").write_text(".worktrees/\n*.db\n*.db-*\n*.yaml\n")
+        subprocess.run(["git", "add", ".gitignore"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "test bootstrap"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
+                 "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com"},
+        )
     policy = tmp_path / "default.yaml"
     policy.write_text(
         """
@@ -64,6 +81,166 @@ worktree:
 
 
 class TestOrchestratorHappyPath:
+    @pytest.mark.asyncio
+    async def test_single_write_fails_closed_without_workspace_manager(self, tmp_path):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("pass")
+        async with await build_orch(tmp_path, adapter) as orch:
+            orch._wm = None
+            task = TaskContract(
+                goal="must not touch root",
+                task_type=TaskType.CODE_FIX,
+                allowed_paths=["src/**"],
+            )
+            result = await orch.run(task)
+
+        assert result["outcome"] == "failed"
+        assert "workspace unavailable" in result["detail"]
+        assert not adapter._runs
+
+    @pytest.mark.asyncio
+    async def test_single_eval_exception_cleans_workspace_and_preserves_root(self, tmp_path):
+        import os
+        import subprocess
+
+        repo = tmp_path / "eval-exception-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t.com",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t.com",
+        }
+        (repo / "README.md").write_text("base")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "base"], cwd=repo,
+            check=True, capture_output=True, env=env,
+        )
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        bootstrap = MockHermesAdapter()
+        first = await build_orch(tmp_path, bootstrap)
+        await first.close()
+
+        class WritingAdapter(MockHermesAdapter):
+            async def submit(self, task):
+                (Path(task.workspace.path) / "change.txt").write_text("staged")
+                return await super().submit(task)
+
+        class ExplodingGate:
+            async def run(self, *_args):
+                raise RuntimeError("evaluation exploded")
+
+        adapter = WritingAdapter()
+        adapter.enqueue_scenario("pass")
+        orch = await Orchestrator.build(
+            runtime=adapter,
+            db_path=str(tmp_path / "eval-exception.db"),
+            repo_path=str(repo),
+            policy_path=str(tmp_path / "default.yaml"),
+        )
+        orch._eval_gate = ExplodingGate()
+        task = TaskContract(goal="staged change", task_type=TaskType.CODE_FIX)
+
+        with pytest.raises(RuntimeError, match="evaluation exploded"):
+            await orch.run(task)
+        await orch.close()
+
+        assert subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip() == base
+        assert not (repo / "change.txt").exists()
+        assert not list((repo / ".worktrees").glob("**/single-*"))
+
+    @pytest.mark.asyncio
+    async def test_single_write_integrates_only_after_pass(self, tmp_path):
+        import os
+        import subprocess
+
+        repo = tmp_path / "single-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t.com",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t.com",
+        }
+        subprocess.run(["git", "commit", "--allow-empty", "-m", "base"], cwd=repo,
+                       check=True, capture_output=True, env=env)
+        bootstrap = MockHermesAdapter()
+        first = await build_orch(tmp_path, bootstrap)
+        await first.close()
+
+        class WritingAdapter(MockHermesAdapter):
+            async def submit(self, task):
+                assert Path(task.workspace.path) != repo
+                (Path(task.workspace.path) / "delivered.txt").write_text("ok")
+                assert not (repo / "delivered.txt").exists()
+                return await super().submit(task)
+
+        adapter = WritingAdapter()
+        adapter.enqueue_scenario("pass")
+        orch = await Orchestrator.build(
+            runtime=adapter, db_path=str(tmp_path / "single.db"),
+            repo_path=str(repo), policy_path=str(tmp_path / "default.yaml"),
+        )
+        result = await orch.run(TaskContract(
+            goal="write one file", task_type=TaskType.CODE_FIX,
+            allowed_paths=["delivered.txt"],
+        ))
+        await orch.close()
+        assert result["outcome"] == "completed"
+        assert (repo / "delivered.txt").read_text() == "ok"
+
+    @pytest.mark.asyncio
+    async def test_single_completed_wrong_rolls_back_root(self, tmp_path):
+        import os
+        import subprocess
+
+        repo = tmp_path / "wrong-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t.com",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t.com",
+        }
+        subprocess.run(["git", "commit", "--allow-empty", "-m", "base"], cwd=repo,
+                       check=True, capture_output=True, env=env)
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        bootstrap = MockHermesAdapter()
+        first = await build_orch(tmp_path, bootstrap)
+        await first.close()
+
+        class WrongAdapter(MockHermesAdapter):
+            async def submit(self, task):
+                (Path(task.workspace.path) / "wrong.txt").write_text("wrong")
+                return await super().submit(task)
+
+        adapter = WrongAdapter()
+        adapter.enqueue_scenario("pass")
+        adapter.enqueue_scenario("pass")
+        orch = await Orchestrator.build(
+            runtime=adapter, db_path=str(tmp_path / "wrong.db"),
+            repo_path=str(repo), policy_path=str(tmp_path / "default.yaml"),
+        )
+        result = await orch.run(TaskContract(
+            goal="write only allowed", task_type=TaskType.CODE_FIX,
+            allowed_paths=["allowed.txt"],
+        ))
+        await orch.close()
+        final = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                               capture_output=True, text=True).stdout.strip()
+        assert result["outcome"] == "failed"
+        assert final == base
+        assert not (repo / "wrong.txt").exists()
+
     @pytest.mark.asyncio
     async def test_delegation_delivers_worktree_artifacts_to_root_before_completed(self, tmp_path):
         import os

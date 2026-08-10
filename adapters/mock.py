@@ -12,6 +12,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from adapters.runtime import RuntimeCapabilities
@@ -89,6 +90,14 @@ class MockHermesAdapter:
 
     async def submit(self, task: TaskContract) -> RunHandle:
         scenario = self._scenario_queue.pop(0) if self._scenario_queue else {}
+        if task.workspace and scenario.get("files_changed"):
+            for raw_path in scenario["files_changed"]:
+                target = (Path(task.workspace.path) / raw_path).resolve()
+                root = Path(task.workspace.path).resolve()
+                target.relative_to(root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    target.write_text("mock staged change\n", encoding="utf-8")
         run_id = uuid.uuid4().hex
         self._runs[run_id] = _RunState(task_id=task.id, scenario=scenario)
         return RunHandle(run_id=run_id, task_id=task.id)

@@ -15,12 +15,182 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import re
 import subprocess
 from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
 
 import yaml
+
+
+class WorkspaceUnavailableError(RuntimeError):
+    """Raised when a write task cannot obtain a safe Git workspace."""
+
+
+@dataclasses.dataclass
+class ExecutionWorkspace:
+    """Isolated Git worktree used by every write execution."""
+
+    repo_path: Path
+    path: Path
+    branch: str
+    task_id: str
+    execution_id: str
+    base_sha: str
+    cleaned: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        repo_path: str | Path,
+        task_id: str,
+        execution_id: str = "single",
+        base_path: str | Path = ".worktrees",
+    ) -> ExecutionWorkspace:
+        repo = Path(repo_path).resolve()
+        if not _is_git_repo(repo):
+            raise WorkspaceUnavailableError(
+                f"write task requires a usable Git repository: {repo}"
+            )
+        _validate_identifier(task_id, "task_id")
+        _validate_identifier(execution_id, "execution_id")
+        dirty = _git(repo, ["status", "--porcelain", "--untracked-files=all"])
+        if dirty.strip():
+            raise WorkspaceUnavailableError("root repository must be clean before execution")
+
+        root = Path(base_path)
+        if not root.is_absolute():
+            root = repo / root
+        path = root / task_id / execution_id
+        branch = f"agent/{task_id}/{execution_id}"
+        base_sha = _git(repo, ["rev-parse", "HEAD"]).strip()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _git(repo, ["worktree", "add", "-b", branch, str(path), base_sha])
+        except RuntimeError as exc:
+            raise WorkspaceUnavailableError(str(exc)) from exc
+        return cls(
+            repo_path=repo,
+            path=path,
+            branch=branch,
+            task_id=task_id,
+            execution_id=execution_id,
+            base_sha=base_sha,
+        )
+
+    @property
+    def worktree_path(self) -> Path:
+        """Backward-compatible alias used by existing workspace callers."""
+        return self.path
+
+    def changed_files(self) -> list[str]:
+        """Return the trusted Git diff, including untracked files."""
+        diff = _git(self.path, ["diff", "--name-only", "-z", self.base_sha])
+        untracked = _git(
+            self.path, ["ls-files", "--others", "--exclude-standard", "-z"]
+        )
+        return list(dict.fromkeys(name for name in (diff + untracked).split("\0") if name))
+
+    def integrate(self) -> None:
+        """Commit and merge this workspace, rolling back on any error."""
+        if self.cleaned:
+            raise RuntimeError("execution workspace is already cleaned")
+        try:
+            status = _git(self.path, ["status", "--porcelain"])
+            if status.strip():
+                _git(self.path, ["add", "-A"])
+                _git(
+                    self.path,
+                    [
+                        "-c",
+                        "user.name=Adaptive Agent Orchestrator",
+                        "-c",
+                        "user.email=adaptive-agent-orchestrator@users.noreply.github.com",
+                        "commit",
+                        "-m",
+                        f"agent({self.execution_id}): deliver {self.task_id}",
+                    ],
+                )
+            _git(
+                self.repo_path,
+                [
+                    "-c",
+                    "user.name=Adaptive Agent Orchestrator",
+                    "-c",
+                    "user.email=adaptive-agent-orchestrator@users.noreply.github.com",
+                    "merge",
+                    "--no-ff",
+                    self.branch,
+                    "-m",
+                    f"integrate {self.task_id}/{self.execution_id}",
+                ],
+            )
+        except Exception:
+            self.rollback()
+            raise
+        self.cleanup()
+
+    def rollback(self) -> None:
+        """Restore the integration base and remove all execution artifacts."""
+        if self.cleaned:
+            return
+        with contextlib.suppress(RuntimeError):
+            _git(self.repo_path, ["merge", "--abort"])
+        current = _git(self.repo_path, ["rev-parse", "HEAD"]).strip()
+        if current != self.base_sha:
+            _git(self.repo_path, ["reset", "--merge", self.base_sha])
+        self.cleanup()
+
+    def cleanup(self) -> None:
+        """Idempotently remove the worktree and its temporary branch."""
+        if self.cleaned:
+            return
+        with contextlib.suppress(RuntimeError):
+            _git(self.repo_path, ["worktree", "remove", "--force", str(self.path)])
+        with contextlib.suppress(RuntimeError):
+            _git(self.repo_path, ["branch", "-D", self.branch])
+        self.cleaned = True
+
+
+@dataclasses.dataclass
+class WorkspaceExecution:
+    """Shared lifecycle abstraction used by single and delegated executions."""
+
+    workspace: ExecutionWorkspace
+    read_only: bool = False
+
+    def changed_files(self) -> list[str]:
+        changed = self.workspace.changed_files()
+        if self.read_only and changed:
+            raise RuntimeError(f"read-only execution changed files: {changed}")
+        return changed
+
+    def finish(self, *, passed: bool) -> None:
+        if passed:
+            self.workspace.integrate()
+        else:
+            self.workspace.rollback()
+
+    def cleanup(self) -> None:
+        self.workspace.cleanup()
+
+
+def _is_git_repo(repo: Path) -> bool:
+    if not repo.is_dir():
+        return False
+    result = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def _validate_identifier(value: str, name: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise ValueError(f"unsafe {name}: {value!r}")
 
 
 class WorktreeStatus(StrEnum):
@@ -147,7 +317,7 @@ class WorkspaceManager:
         """Atomically return the clean root to its pre-integration commit."""
         with contextlib.suppress(RuntimeError):
             _git(self._repo, ["merge", "--abort"])
-        _git(self._repo, ["reset", "--hard", base_sha])
+        _git(self._repo, ["reset", "--merge", base_sha])
 
     def commit_changes(self, task_id: str, child_id: str) -> str:
         """Commit all child worktree changes and return the child branch tip."""

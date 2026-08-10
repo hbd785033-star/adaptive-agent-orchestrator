@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -19,14 +20,15 @@ def run(
     task_type: str = typer.Option("general", "--type", "-t", help="Task type"),
     risk: int = typer.Option(1, "--risk", "-r", help="Risk level 1-4"),
     complexity: int = typer.Option(1, "--complexity", "-c", help="Complexity 1-5"),
-    allowed_paths: list[str] | None = typer.Option(None, "--allow", "-a", help="Allowed file paths (glob)"),
-    forbidden: list[str] | None = typer.Option(None, "--forbid", "-f", help="Forbidden actions"),
-    criteria: list[str] | None = typer.Option(None, "--criterion", "-x", help="Success criteria"),
+    allowed_paths: list[str] | None = typer.Option(None, "--allow", "-a", help="Allowed file paths (glob)"),  # noqa: B008
+    forbidden: list[str] | None = typer.Option(None, "--forbid", "-f", help="Forbidden actions"),  # noqa: B008
+    criteria: list[str] | None = typer.Option(None, "--criterion", "-x", help="Success criteria"),  # noqa: B008
     hermes_url: str = typer.Option("ws://localhost:4999", "--hermes", help="Hermes Gateway URL"),
     hermes_key: str | None = typer.Option(None, "--key", help="Hermes API key"),
     policy: str = typer.Option("policies/default.yaml", "--policy", help="Policy YAML path"),
     repo: str = typer.Option(".", "--repo", help="Repo path for worktree and evals"),
     mock: bool = typer.Option(False, "--mock", help="Use mock adapter (no live Hermes)"),
+    record_out: Path | None = typer.Option(None, "--record-out", help="Write ExecutionRecord 0.1 JSON"),  # noqa: B008
 ) -> None:
     """Submit a task to the orchestrator."""
     asyncio.run(_run_task(
@@ -42,6 +44,7 @@ def run(
         policy=policy,
         repo=repo,
         mock=mock,
+        record_out=record_out,
     ))
 
 
@@ -78,12 +81,47 @@ async def _run_task(**kwargs) -> None:  # noqa: ANN003
         runtime = HermesAdapter(url=kwargs["hermes_url"], api_key=kwargs["hermes_key"])
         await runtime.connect()  # type: ignore[attr-defined]
 
+    started_at = datetime.now(UTC)
     async with await Orchestrator.build(
         runtime=runtime,  # type: ignore[arg-type]
         policy_path=kwargs["policy"],
         repo_path=kwargs["repo"],
     ) as orch:
         result = await orch.run(task)
+
+    if kwargs.get("record_out"):
+        from contracts.execution import ExecutionRecord
+
+        finished_at = datetime.now(UTC)
+        usage = result.get("usage", {})
+        status = "completed" if result.get("outcome") == "completed" else "failed"
+        record = ExecutionRecord(
+            task_id=task.id,
+            run_id=str(result.get("run_id") or f"aao-{task.id}"),
+            model="mock" if kwargs["mock"] else "unknown",
+            provider="fixture" if kwargs["mock"] else "unknown",
+            status=status,
+            started_at=started_at,
+            finished_at=finished_at,
+            latency_seconds=(finished_at - started_at).total_seconds(),
+            input_tokens=int(usage.get("input_tokens", 0)),
+            output_tokens=int(usage.get("output_tokens", 0)),
+            cached_tokens=0,
+            cost_usd=float(usage.get("estimated_cost_usd") or 0.0),
+            tool_calls=[],
+            files_changed=list(result.get("files_changed", [])),
+            output=str(result.get("detail") or result.get("summary") or ""),
+            workspace_root=result.get("workspace_root"),
+            isolation_level=str(result.get("isolation_level", "none")),
+            metadata={
+                "route": result.get("route"),
+                "retries": result.get("retry_count", 0),
+                "verification_status": result.get("eval", {}).get("overall", "not_run"),
+                "trial": 1,
+                "identity_observed": kwargs["mock"],
+            },
+        )
+        record.export(kwargs["record_out"])
 
     _print_result(result)
 
@@ -111,6 +149,19 @@ def _print_result(result: dict) -> None:
             console.print(f"   Failed checks: {failed}")
         else:
             console.print()
+
+
+@app.command(name="export-record")
+def export_record(
+    source: Path = typer.Argument(..., exists=True, readable=True),  # noqa: B008
+    out: Path = typer.Option(..., "--out", "-o"),  # noqa: B008
+) -> None:
+    """Validate and export an ExecutionRecord schema 0.1 JSON document."""
+    from contracts.execution import ExecutionRecord
+
+    record = ExecutionRecord.model_validate_json(source.read_text(encoding="utf-8"))
+    destination = record.export(out)
+    console.print(str(destination))
 
 
 @app.command()

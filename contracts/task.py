@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from contracts.execution import SuccessCriterion
+
 
 class TaskType(StrEnum):
     CODE_FIX = "code_fix"
@@ -56,7 +58,7 @@ class TaskContract(BaseModel):
     # --- scope constraints (encoded into agent prompt + verified post-exec) ---
     allowed_paths: list[str] = Field(default_factory=list)
     forbidden_actions: list[str] = Field(default_factory=list)
-    success_criteria: list[str] = Field(default_factory=list)
+    success_criteria: list[str | SuccessCriterion] = Field(default_factory=list)
 
     # --- output expectations ---
     output_schema: list[str] = Field(

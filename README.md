@@ -51,7 +51,8 @@ aao run "Fix the null pointer in login handler" \
     --type code_fix \
     --complexity 2 \
     --allow "src/auth/**" \
-    --allow "tests/auth/**"
+    --allow "tests/auth/**" \
+    --record-out execution-record.json
 ```
 
 输出示例：
@@ -119,6 +120,18 @@ aao run "Refactor auth module" \
 ---
 
 ## 架构分层
+
+`--record-out` 输出 provider-neutral、版本化的 `ExecutionRecord 0.1`。AAO 不导入
+AE；独立评估通过 JSON 边界完成：
+
+```bash
+agent-eval evaluate execution-record.json --dataset path/to/dataset.yaml
+```
+
+所有写任务，包括 `single` 路由，都先在 Git worktree 中执行。只有 safety、
+policy 与 outcome verification 全部通过后才集成到 root；失败、运行时异常或
+评估异常会丢弃 staging workspace，root 保持不变。只读任务若产生可信 Git diff
+则直接失败。
 
 | 层 | 职责 | 关键文件 |
 |---|---|---|

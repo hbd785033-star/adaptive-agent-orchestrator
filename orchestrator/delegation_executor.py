@@ -30,6 +30,7 @@ from contracts.result import AgentResult, RunHandle, RunStatus
 from contracts.task import TaskContract
 from evals.gate import DeterministicEvalGate
 from orchestrator.budget import BudgetState
+from orchestrator.execution_policy import ExecutionPolicy
 from telemetry.events import TelemetryRecorder
 
 log = structlog.get_logger(__name__)
@@ -54,10 +55,12 @@ class DelegationExecutor:
         runtime: AgentRuntime,
         eval_gate: DeterministicEvalGate,
         telemetry: TelemetryRecorder,
+        execution_policy: ExecutionPolicy | None = None,
     ) -> None:
         self._runtime = runtime
         self._eval_gate = eval_gate
         self._tel = telemetry
+        self._execution_policy = execution_policy
 
     async def execute(
         self,
@@ -284,6 +287,22 @@ class DelegationExecutor:
                     event.payload,
                     handle.run_id,
                 )
+                if event.type == "approval_request" and self._execution_policy:
+                    decision = self._execution_policy.authorize_event(
+                        task,
+                        event.payload,
+                        calls_used=max(0, budget.calls_used - 1),
+                        approval=False,
+                    )
+                    if not decision.allowed:
+                        await self._runtime.cancel(handle)
+                        return ChildExecution(
+                            child_id=child_id,
+                            run_id=handle.run_id,
+                            status="failed",
+                            duration_ms=int((time.monotonic() - t0) * 1000),
+                            retry_count=1 if retry else 0,
+                        )
                 if event.type in ("completed", "error"):
                     break
 
