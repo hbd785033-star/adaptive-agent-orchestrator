@@ -8,8 +8,8 @@ Design notes
 ------------
 - Methods accept RunHandle objects, not raw run_id strings.
   This prevents accidental cross-run ID confusion in concurrent scenarios.
-- capabilities() must be called once after connect() to let the engine
-  know which optional features (steer, delegation, streaming) are available.
+- capabilities() is cheap / cached; the engine can call it before task execution
+  to know which optional features (steer, delegation, streaming) are available.
 - events() is the primary result path; result()/wait() is a convenience
   wrapper for callers that don't need streaming.
 """
@@ -35,6 +35,19 @@ class RuntimeCapabilities:
     cancellation: bool = True          # supports cancel()
     session_resume: bool = False       # can reconnect and resume (cursor)
     max_concurrent_runs: int = 8       # advisory — how many parallel submits are safe
+
+    filesystem_read: bool = False
+    filesystem_write: bool = False
+    shell: bool = False
+    tests: bool = False
+    web: bool = False
+    background_execution: bool = False
+    persistent_tasks: bool = False
+    human_in_loop: bool = False
+    native_kanban: bool = False
+    structured_output: bool = False
+    usage_observable: bool = False
+    cost_observable: bool = False
 
 
 @runtime_checkable
