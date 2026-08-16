@@ -25,20 +25,24 @@ class RunHandle(BaseModel):
 
 
 class Usage(BaseModel):
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
     estimated_cost_usd: float | None = None
 
     def __add__(self, other: Usage) -> Usage:
         return Usage(
-            input_tokens=self.input_tokens + other.input_tokens,
-            output_tokens=self.output_tokens + other.output_tokens,
-            total_tokens=self.total_tokens + other.total_tokens,
-            estimated_cost_usd=(
-                (self.estimated_cost_usd or 0) + (other.estimated_cost_usd or 0)
+            input_tokens=_sum_observed(self.input_tokens, other.input_tokens),
+            output_tokens=_sum_observed(self.output_tokens, other.output_tokens),
+            total_tokens=_sum_observed(self.total_tokens, other.total_tokens),
+            estimated_cost_usd=_sum_observed(
+                self.estimated_cost_usd, other.estimated_cost_usd
             ),
         )
+
+
+def _sum_observed(left: int | float | None, right: int | float | None):
+    return None if left is None or right is None else left + right
 
 
 class AgentEvent(BaseModel):
@@ -89,10 +93,10 @@ class ErrorPayload(BaseModel):
 # ── Final result ──────────────────────────────────────────────────────────────
 
 class AgentResult(BaseModel):
-    run_id: str
+    run_id: str | None
     task_id: str
     status: RunStatus
-    usage: Usage = Field(default_factory=Usage)
+    usage: Usage | None = None
     files_changed: list[str] = Field(default_factory=list)
     summary: str = ""
     unresolved_risks: list[str] = Field(default_factory=list)

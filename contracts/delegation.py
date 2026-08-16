@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from contracts.evaluation import EvalResult
 from contracts.result import AgentResult, Usage
@@ -20,19 +20,29 @@ class ChildExecution(BaseModel):
     """Result of one child agent within a delegation run."""
 
     child_id: str
-    run_id: str
+    run_id: str | None = None
+    attempt_run_ids: list[str] = Field(default_factory=list)
 
     status: Literal["completed", "failed", "cancelled", "timeout"] = "failed"
 
     result: AgentResult | None = None
     eval_result: EvalResult | None = None
 
-    input_tokens: int = 0
-    output_tokens: int = 0
-    estimated_cost_usd: float = 0.0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    estimated_cost_usd: float | None = None
 
     retry_count: int = 0
     duration_ms: int = 0
+
+    @model_validator(mode="after")
+    def retain_current_attempt_identity(self) -> ChildExecution:
+        """Every observed current run is also durable attempt provenance."""
+        observed = list(dict.fromkeys(self.attempt_run_ids))
+        if self.run_id is not None and self.run_id not in observed:
+            observed.append(self.run_id)
+        self.attempt_run_ids = observed
+        return self
 
     @property
     def succeeded(self) -> bool:
@@ -43,7 +53,9 @@ class ChildExecution(BaseModel):
         )
 
     @property
-    def usage(self) -> Usage:
+    def usage(self) -> Usage | None:
+        if self.input_tokens is None or self.output_tokens is None:
+            return None
         return Usage(
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
@@ -72,16 +84,19 @@ class DelegationResult(BaseModel):
         return len(self.children) - self.successful
 
     @property
-    def total_input_tokens(self) -> int:
-        return sum(c.input_tokens for c in self.children)
+    def total_input_tokens(self) -> int | None:
+        values = [c.input_tokens for c in self.children]
+        return None if any(value is None for value in values) else sum(values)
 
     @property
-    def total_output_tokens(self) -> int:
-        return sum(c.output_tokens for c in self.children)
+    def total_output_tokens(self) -> int | None:
+        values = [c.output_tokens for c in self.children]
+        return None if any(value is None for value in values) else sum(values)
 
     @property
-    def total_cost_usd(self) -> float:
-        return sum(c.estimated_cost_usd for c in self.children)
+    def total_cost_usd(self) -> float | None:
+        values = [c.estimated_cost_usd for c in self.children]
+        return None if any(value is None for value in values) else sum(values)
 
     @property
     def duration_ms(self) -> int:

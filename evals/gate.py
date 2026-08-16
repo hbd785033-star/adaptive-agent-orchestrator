@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from contracts.evaluation import EvalCheck, EvalResult, EvalStatus
 from contracts.result import AgentResult
 from contracts.task import TaskContract
+from evals.verifier import CriterionVerifier
 from orchestrator.budget import BudgetState
 
 # ── Individual checks ─────────────────────────────────────────────────────────
@@ -49,6 +50,8 @@ def _canonical_relative_path(raw_path: str, repo_path: Path) -> str | None:
 def trusted_changed_files(
     repo_path: str | Path,
     base_sha: str | None = None,
+    *,
+    include_ignored: bool = False,
 ) -> list[str] | None:
     """Derive changed paths from Git, including staged, unstaged and untracked."""
     repo = Path(repo_path)
@@ -63,11 +66,16 @@ def trusted_changed_files(
         return None
     diff = _run(["diff", "--name-only", "-z", base_sha or "HEAD"])
     untracked = _run(["ls-files", "--others", "--exclude-standard", "-z"])
-    if diff.returncode != 0 or untracked.returncode != 0:
+    ignored = (
+        _run(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])
+        if include_ignored
+        else subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+    )
+    if diff.returncode != 0 or untracked.returncode != 0 or ignored.returncode != 0:
         return None
     names = [
         value.decode(errors="surrogateescape")
-        for value in (diff.stdout + untracked.stdout).split(b"\0")
+        for value in (diff.stdout + untracked.stdout + ignored.stdout).split(b"\0")
         if value
     ]
     return list(dict.fromkeys(names))
@@ -133,6 +141,48 @@ def check_budget(result: AgentResult, budget: BudgetState) -> EvalCheck:
         name="budget",
         status=EvalStatus.PASS,
         detail=f"calls={budget.calls_used}/{budget.config.max_total_calls}",
+    )
+
+
+def check_read_only(changed_files: list[str], task: TaskContract) -> EvalCheck:
+    """A read-only contract fails on any trusted Git diff."""
+    from contracts.task import TaskType
+
+    readonly = task.task_type in {TaskType.CODE_REVIEW, TaskType.PARALLEL_RESEARCH}
+    if not readonly:
+        return EvalCheck(name="read_only", status=EvalStatus.SKIP, detail="write task")
+    if changed_files:
+        return EvalCheck(
+            name="read_only",
+            status=EvalStatus.FAIL,
+            detail=f"read-only task changed files: {changed_files}",
+            blocker=True,
+        )
+    return EvalCheck(name="read_only", status=EvalStatus.PASS, detail="no repository changes")
+
+
+def check_success_criteria(repo_path: Path, task: TaskContract, completed: bool) -> EvalCheck:
+    """Structured criteria are executable evidence; completion alone never passes them."""
+    from contracts.execution import SuccessCriterion
+
+    unverifiable = [item for item in task.success_criteria if isinstance(item, str)]
+    if unverifiable:
+        return EvalCheck(
+            name="success_criteria",
+            status=EvalStatus.FAIL,
+            detail=f"unverifiable criteria: {unverifiable}",
+            blocker=True,
+        )
+    criteria = [item for item in task.success_criteria if isinstance(item, SuccessCriterion)]
+    if not criteria:
+        return EvalCheck(name="success_criteria", status=EvalStatus.SKIP, detail="no criteria")
+    outcome = CriterionVerifier(repo_path).verify(criteria, completed=completed)
+    failed = [item.detail for item in outcome.criteria if not item.passed]
+    return EvalCheck(
+        name="success_criteria",
+        status=EvalStatus.PASS if outcome.passed else EvalStatus.FAIL,
+        detail="all criteria passed" if outcome.passed else f"failed criteria: {failed}",
+        blocker=True,
     )
 
 
@@ -273,13 +323,19 @@ class DeterministicEvalGate:
 
         effective_repo = Path(task.workspace.path) if task.workspace else self._repo
         base_sha = task.context.get("_eval_base_sha")
-        git_changed = trusted_changed_files(effective_repo, base_sha=base_sha)
+        git_changed = trusted_changed_files(
+            effective_repo, base_sha=base_sha, include_ignored=False
+        )
         changed_files = git_changed if git_changed is not None else result.files_changed
         trusted_result = result.model_copy(update={"files_changed": changed_files})
 
         # Synchronous checks
         checks.append(check_paths(trusted_result, task, repo_path=effective_repo))
         checks.append(check_budget(result, budget))
+        checks.append(check_read_only(changed_files, task))
+        checks.append(check_success_criteria(
+            effective_repo, task, completed=result.status.value == "completed"
+        ))
 
         # Async checks (run in parallel)
         lint_task = asyncio.create_task(check_lint(effective_repo, changed_files))
@@ -287,5 +343,17 @@ class DeterministicEvalGate:
         secrets_task = asyncio.create_task(check_secrets(effective_repo, changed_files))
 
         checks.extend(await asyncio.gather(lint_task, tests_task, secrets_task))
+
+        # Verifier commands are untrusted with respect to a read-only contract.
+        # Re-scan tracked/untracked state here. The engine's frozen repository
+        # baselines perform the authoritative final ignored-file comparison.
+        post_changed = trusted_changed_files(
+            effective_repo, base_sha=base_sha, include_ignored=False
+        )
+        if post_changed is not None:
+            checks = [
+                check_read_only(post_changed, task) if check.name == "read_only" else check
+                for check in checks
+            ]
 
         return EvalResult.aggregate(task.id, result.run_id, checks)

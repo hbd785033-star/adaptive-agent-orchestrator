@@ -18,14 +18,19 @@ from contracts.delegation import DelegationResult
 from contracts.evaluation import EvalStatus
 from contracts.result import RunStatus
 from contracts.task import TaskContract
-from evals.gate import DeterministicEvalGate
+from evals.gate import DeterministicEvalGate, trusted_changed_files
 from orchestrator.budget import ApprovalGate, BudgetConfig, BudgetState
 from orchestrator.delegation_executor import DelegationExecutor
+from orchestrator.execution_policy import ExecutionPolicy
 from orchestrator.profiler import TaskProfiler
 from orchestrator.prompt_guard import inject_constraints, split_for_delegation
 from orchestrator.router import RuleRouter
 from orchestrator.state_machine import StateMachine, TaskRecord, TaskStatus
-from orchestrator.workspace import WorkspaceManager
+from orchestrator.workspace import (
+    ExecutionWorkspace,
+    RepositoryBaseline,
+    WorkspaceManager,
+)
 from storage.database import Database
 from telemetry.events import TelemetryRecorder
 
@@ -62,6 +67,11 @@ class Orchestrator:
         self._router = router
         self._budget_config = budget_config
         self._approval = approval_gate
+        self._execution_policy = ExecutionPolicy(
+            always_require_actions=set(getattr(approval_gate, "_always_require", set())),
+            require_approval_above_calls=budget_config.require_approval_above_calls,
+            max_total_calls=budget_config.max_total_calls,
+        )
         self._eval_gate = eval_gate
         self._wm = workspace_manager
         self._tel = telemetry
@@ -69,6 +79,7 @@ class Orchestrator:
             runtime=runtime,
             eval_gate=eval_gate,
             telemetry=telemetry,
+            execution_policy=self._execution_policy,
         )
 
     @classmethod
@@ -97,9 +108,19 @@ class Orchestrator:
         workspace_manager: WorkspaceManager | None = None
         if Path(repo_path).exists():
             try:
-                workspace_manager = WorkspaceManager(
-                    repo_path=repo_path, policy_path=policy_path
+                import subprocess
+
+                probe = subprocess.run(
+                    ["git", "rev-parse", "--is-inside-work-tree"],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
+                if probe.returncode == 0 and probe.stdout.strip() == "true":
+                    workspace_manager = WorkspaceManager(
+                        repo_path=repo_path, policy_path=policy_path
+                    )
             except Exception:
                 log.warning("workspace_manager_init_failed", repo_path=repo_path)
 
@@ -118,6 +139,51 @@ class Orchestrator:
 
     async def close(self) -> None:
         await self._db.close()
+
+    def _capture_root_baseline(self) -> RepositoryBaseline:
+        if self._wm is None:
+            raise RuntimeError("repository baseline requires a workspace manager")
+        root = self._wm.repo_path.resolve()
+        candidates = [self._wm._base.resolve(), self._db._path.resolve()]
+        candidates.extend(
+            Path(str(self._db._path.resolve()) + suffix)
+            for suffix in ("-wal", "-shm", "-journal")
+        )
+        exclusions: list[str] = []
+        for candidate in candidates:
+            try:
+                exclusions.append(candidate.relative_to(root).as_posix())
+            except ValueError:
+                continue
+        return RepositoryBaseline.capture(
+            root,
+            excluded_paths=tuple(exclusions),
+            protected_paths=(self._wm._base.resolve(),),
+        )
+
+    async def _cancel_and_confirm_terminal(self, handle) -> None:
+        """Cancel a submitted run and prove terminal state before artifact removal."""
+        cancel_error: Exception | None = None
+        try:
+            await self._runtime.cancel(handle)
+        except Exception as exc:
+            cancel_error = exc
+        try:
+            result = await self._runtime.wait(handle)
+        except Exception as exc:
+            detail = f"terminal confirmation failed: {exc}"
+            if cancel_error is not None:
+                detail = f"cancel failed: {cancel_error}; {detail}"
+            raise RuntimeError(f"runtime quiescence could not be established: {detail}") from exc
+        if result.status not in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        }:
+            raise RuntimeError(
+                "runtime quiescence could not be established: "
+                f"wait returned non-terminal status {result.status}"
+            )
 
     async def __aenter__(self) -> Orchestrator:
         return self
@@ -232,86 +298,206 @@ class Orchestrator:
         decision,
         is_retry: bool,
     ) -> dict:
-        # 5. Prompt Guard
-        guarded_task = inject_constraints(task)
+        # Every repository execution, including read-only work, is isolated.
+        if self._wm is None:
+            await record.mark_failed("workspace unavailable for repository task")
+            return self._summary(
+                record, "failed", "workspace unavailable for repository task"
+            )
+        write_task = self._wm.needs_worktree(task.task_type.value)
+        workspace = ExecutionWorkspace.create(
+            self._wm.repo_path,
+            task_id=task.id,
+            execution_id=f"single-{record.retry_count}",
+        )
+        task = task.model_copy(
+            update={"context": {**task.context, "_eval_base_sha": workspace.base_sha}}
+        )
+        guarded_task = inject_constraints(task, workspace.path, workspace.execution_id)
 
         # 6. Submit
+        submission_decision = self._execution_policy.authorize_submission(
+            task, calls_used=budget.calls_used
+        )
+        if not submission_decision.allowed:
+            approved = self._approval.prompt_user(
+                "runtime call threshold requires approval", task
+            )
+            submission_decision = self._execution_policy.authorize_submission(
+                task, calls_used=budget.calls_used, approval=approved
+            )
+        if not submission_decision.allowed:
+            workspace.rollback()
+            await record.mark_abandoned(submission_decision.reason)
+            return self._summary(record, "abandoned", submission_decision.reason)
+
         violation = budget.reserve_calls(1)
         if violation:
+            workspace.rollback()
             await record.mark_abandoned(f"budget: {violation.detail}")
             return self._summary(record, "abandoned", violation.detail)
+        root_baseline: RepositoryBaseline | None = None
+        workspace_baseline: RepositoryBaseline | None = None
         try:
+            if not write_task:
+                root_baseline = self._capture_root_baseline()
+                workspace_baseline = RepositoryBaseline.capture(workspace.path)
             handle = await self._runtime.submit(guarded_task)
         except Exception:
             budget.release_reserved_call()
+            if workspace:
+                workspace.rollback()
             raise
-        budget.commit_reserved_call()
-        await record.mark_running(handle.run_id)
-        await self._tel.record(
-            task.id, "task_submitted", {"run_id": handle.run_id}, handle.run_id
-        )
-
-        # 7. Stream events — watch for approval / usage / errors
-        async for event in self._runtime.events(handle):
+        try:
+            budget.commit_reserved_call()
+            await record.mark_running(handle.run_id)
             await self._tel.record(
-                task.id, f"event_{event.type}", event.payload, handle.run_id
+                task.id, "task_submitted", {"run_id": handle.run_id}, handle.run_id
             )
+        except Exception:
+            await self._cancel_and_confirm_terminal(handle)
+            workspace.rollback()
+            raise
 
-            if event.type == "approval_request":
-                approved = self._approval.prompt_user(
-                    event.payload.get("reason", "agent requested approval"), task
+        terminal_confirmed = False
+        try:
+            # 7. Stream events — watch for approval / usage / errors
+            async for event in self._runtime.events(handle):
+                await self._tel.record(
+                    task.id, f"event_{event.type}", event.payload, handle.run_id
                 )
-                if not approved:
-                    await self._runtime.cancel(handle)
-                    await record.mark_failed("approval denied mid-run")
-                    return self._summary(record, "failed", "approval denied")
 
-            elif event.type in ("completed", "error"):
-                break
+                if event.type == "approval_request":
+                    await self._cancel_and_confirm_terminal(handle)
+                    terminal_confirmed = True
+                    workspace.rollback()
+                    await record.mark_failed("runtime approval request cannot be resumed")
+                    return self._summary(
+                        record,
+                        "failed",
+                        "runtime approval request failed closed",
+                    )
 
-        # 8. Collect result
-        agent_result = await self._runtime.wait(handle)
+                elif event.type in ("completed", "error"):
+                    break
 
-        if agent_result.status == RunStatus.FAILED:
-            await record.mark_failed(agent_result.error or "agent reported failure")
-            return self._summary(record, "failed", agent_result.error or "agent error")
+            agent_result = await self._runtime.wait(handle)
+            terminal_confirmed = agent_result.status in {
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            }
+            if not terminal_confirmed:
+                raise RuntimeError(
+                    f"runtime wait returned non-terminal status {agent_result.status}"
+                )
+            if agent_result.status == RunStatus.FAILED:
+                workspace.rollback()
+                await record.mark_failed(agent_result.error or "agent reported failure")
+                return self._summary(record, "failed", agent_result.error or "agent error")
+            usage = await self._runtime.usage(handle)
+        except Exception as exc:
+            if not terminal_confirmed:
+                try:
+                    await self._cancel_and_confirm_terminal(handle)
+                    terminal_confirmed = True
+                except Exception as quiescence_error:
+                    raise RuntimeError(str(quiescence_error)) from exc
+            if not workspace.cleaned:
+                workspace.rollback()
+            raise
+        try:
+            if usage.input_tokens is not None and usage.output_tokens is not None:
+                await self._db.append_usage(
+                    task.id,
+                    handle.run_id,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.estimated_cost_usd,
+                )
 
-        usage = await self._runtime.usage(handle)
-        await self._db.append_usage(
-            task.id,
-            handle.run_id,
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.estimated_cost_usd,
-        )
-
-        # 9. Eval gate
-        await record.mark_evaluating()
-        eval_result = await self._eval_gate.run(task, agent_result, budget)
-        await self._db.append_eval_result(
-            task.id,
-            handle.run_id,
-            eval_result.overall.value,
-            [c.model_dump() for c in eval_result.checks],
-        )
-        await self._tel.record(
-            task.id,
-            "eval_completed",
-            {
-                "overall": eval_result.overall.value,
-                "failed_checks": [c.name for c in eval_result.failed_checks()],
-            },
-            handle.run_id,
-        )
+            # 9. Eval gate
+            await record.mark_evaluating()
+            eval_result = await self._eval_gate.run(guarded_task, agent_result, budget)
+            await self._db.append_eval_result(
+                task.id,
+                handle.run_id,
+                eval_result.overall.value,
+                [c.model_dump() for c in eval_result.checks],
+            )
+            await self._tel.record(
+                task.id,
+                "eval_completed",
+                {
+                    "overall": eval_result.overall.value,
+                    "failed_checks": [c.name for c in eval_result.failed_checks()],
+                },
+                handle.run_id,
+            )
+        except Exception:
+            if not workspace.cleaned:
+                workspace.rollback()
+            raise
 
         # 10. Outcome
         if eval_result.overall == EvalStatus.PASS:
-            await record.mark_completed()
+            if not write_task:
+                root_changes = root_baseline.changed() if root_baseline else ["<root>"]
+                workspace_changes = (
+                    workspace_baseline.changed()
+                    if workspace_baseline
+                    else ["<workspace>"]
+                )
+                if root_changes or workspace_changes:
+                    cleanup_error = ""
+                    try:
+                        workspace.cleanup()
+                    except Exception as exc:
+                        cleanup_error = f"; cleanup failed: {exc}"
+                    detail = (
+                        "read-only final baseline mismatch: "
+                        f"root={root_changes}, workspace={workspace_changes}"
+                        f"{cleanup_error}"
+                    )
+                    await record.mark_failed("read_only_mutation")
+                    return self._summary(
+                        record,
+                        "failed",
+                        detail,
+                        eval_result=eval_result,
+                        usage=usage,
+                        files_changed=workspace_changes,
+                        workspace_root=str(workspace.path),
+                        isolation_level="workspace",
+                        verification_status="fail",
+                    )
+            try:
+                trusted_files = workspace.changed_files()
+                if write_task:
+                    workspace.integrate()
+                else:
+                    workspace.cleanup()
+                await record.mark_completed()
+            except Exception as exc:
+                if workspace.cleaned:
+                    self._wm.rollback(workspace.base_sha)
+                else:
+                    workspace.rollback()
+                await record.mark_failed("integration_failed")
+                return self._summary(record, "failed", str(exc), eval_result=eval_result)
             return self._summary(
-                record, "completed", "", eval_result=eval_result, usage=usage
+                record,
+                "completed",
+                "",
+                eval_result=eval_result,
+                usage=usage,
+                files_changed=trusted_files,
+                workspace_root=str(workspace.path),
+                isolation_level="workspace",
             )
 
         # Eval failed — retry once if budget allows
+        workspace.rollback()
         retry_violation = budget.check_retries()
         if not retry_violation:
             await record.mark_failed("eval_failed")
@@ -338,17 +524,50 @@ class Orchestrator:
         budget: BudgetState,
         decision,
     ) -> dict:
-        # 5. Workspace allocation (write tasks only)
+        # 5. Workspace allocation is all-or-nothing for every delegated child.
+        if self._wm is None:
+            await record.mark_failed("workspace unavailable for delegated task")
+            return self._summary(
+                record, "failed", "workspace unavailable for delegated task"
+            )
         child_count = len(task.subtasks) if task.subtasks else budget.config.max_children
+        batch_approval: bool | None = None
+        batch_decisions = [
+            self._execution_policy.authorize_submission(
+                task, calls_used=budget.calls_used + offset
+            )
+            for offset in range(child_count)
+        ]
+        if any(not item.allowed for item in batch_decisions):
+            approved = self._approval.prompt_user(
+                "delegated runtime call threshold requires approval", task
+            )
+            batch_approval = approved
+            batch_decisions = [
+                self._execution_policy.authorize_submission(
+                    task,
+                    calls_used=budget.calls_used + offset,
+                    approval=approved,
+                )
+                for offset in range(child_count)
+            ]
+        if any(not item.allowed for item in batch_decisions):
+            reason = next(item.reason for item in batch_decisions if not item.allowed)
+            await record.mark_abandoned(reason)
+            return self._summary(record, "abandoned", reason)
         worktrees: list[tuple[str, Path | None]] = []
         integration_base: str | None = None
-        if (
-            self._wm
-            and self._wm.needs_worktree(task.task_type.value)
-        ):
+        read_only = not self._wm.needs_worktree(task.task_type.value)
+        root_baseline: RepositoryBaseline | None = None
+        worktree_baselines: dict[str, RepositoryBaseline] = {}
+        try:
             self._wm.ensure_root_clean()
             integration_base = self._wm.current_head()
-            task.context["_eval_base_sha"] = integration_base
+            task = task.model_copy(
+                update={
+                    "context": {**task.context, "_eval_base_sha": integration_base}
+                }
+            )
             for i in range(child_count):
                 child_id = f"child-{i+1}"
                 wt = self._wm.allocate(task.id, child_id)
@@ -360,58 +579,125 @@ class Orchestrator:
                     child_id=child_id,
                     worktree_path=str(wt.worktree_path),
                 )
+        except Exception as exc:
+            cleanup_errors = []
+            for child_id, _ in worktrees:
+                try:
+                    self._wm.clean(task.id, child_id)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"{child_id}: {cleanup_exc}")
+            detail = f"workspace allocation failed: {exc}"
+            if cleanup_errors:
+                detail += f"; cleanup failed: {'; '.join(cleanup_errors)}"
+            await record.mark_failed("workspace_allocation_failed")
+            return self._summary(record, "failed", detail)
 
-        # 6. Prompt Guard — produce one contract per child. Read-only children
-        # still use the same splitter so explicit subtask goals are preserved.
-        if not worktrees:
-            worktrees = [(f"child-{i+1}", None) for i in range(child_count)]
-        child_contracts = split_for_delegation(task, worktrees)
+        quarantined_ids: set[str] = set()
+        delegation_result: DelegationResult | None = None
+        try:
+            # 6. Prompt Guard — preserve explicit subtask goals in child contracts.
+            child_contracts = split_for_delegation(task, worktrees)
 
-        # 7. Mark running (using sentinel run_id for delegation parent)
-        await record.mark_running(f"delegation:{task.id}")
-        # 8. Execute children concurrently via DelegationExecutor
-        delegation_result: DelegationResult = await self._delegation_executor.execute(
-            parent_task_id=task.id,
-            children=child_contracts,
-            budget=budget,
-        )
+            if read_only:
+                root_baseline = self._capture_root_baseline()
+                worktree_baselines = {
+                    child_id: RepositoryBaseline.capture(path)
+                    for child_id, path in worktrees
+                    if path is not None
+                }
 
-        # Record aggregate usage
-        await self._db.append_usage(
-            task.id,
-            f"delegation:{task.id}",
-            delegation_result.total_input_tokens,
-            delegation_result.total_output_tokens,
-            delegation_result.total_cost_usd,
-        )
+            # 7. A delegated parent is running, but has no native runtime run.
+            await record.transition(TaskStatus.RUNNING)
+            # 8. Execute children concurrently via DelegationExecutor
+            delegation_result: DelegationResult = await self._delegation_executor.execute(
+                parent_task_id=task.id,
+                children=child_contracts,
+                budget=budget,
+                submission_approval=batch_approval,
+            )
+            quarantined_ids = {
+                child.child_id
+                for child in delegation_result.children
+                if child.status == "timeout"
+            }
 
-        # 9. Evaluate overall outcome
-        await record.mark_evaluating()
+            # Persist only child usage tied to an observed native runtime run.
+            for child in delegation_result.children:
+                if (
+                    child.run_id is None
+                    or child.input_tokens is None
+                    or child.output_tokens is None
+                ):
+                    continue
+                await self._db.append_usage(
+                    task.id,
+                    child.run_id,
+                    child.input_tokens,
+                    child.output_tokens,
+                    child.estimated_cost_usd,
+                )
+        except Exception as exc:
+            cleanup_errors = []
+            for child_id, _ in worktrees:
+                if child_id in quarantined_ids:
+                    continue
+                try:
+                    self._wm.clean(task.id, child_id)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"{child_id}: {cleanup_exc}")
+            detail = f"delegation execution failed: {exc}"
+            if cleanup_errors:
+                detail += f"; cleanup failed: {'; '.join(cleanup_errors)}"
+            if quarantined_ids:
+                detail += f"; quarantined workspaces: {sorted(quarantined_ids)}"
+            await record.mark_failed("delegation_execution_failed")
+            if delegation_result is not None:
+                return self._summary_delegation(
+                    record, delegation_result, detail=detail, outcome="failed"
+                )
+            return self._summary(record, "failed", detail)
+
         status = delegation_result.overall_status
-
-        await self._tel.record(
-            task.id,
-            "delegation_outcome",
-            {
-                "status": status,
-                "successful": delegation_result.successful,
-                "failed": delegation_result.failed,
-                "children": len(delegation_result.children),
-            },
-        )
+        try:
+            # 9. Evaluate overall outcome
+            await record.mark_evaluating()
+            await self._tel.record(
+                task.id,
+                "delegation_outcome",
+                {
+                    "status": status,
+                    "successful": delegation_result.successful,
+                    "failed": delegation_result.failed,
+                    "children": len(delegation_result.children),
+                },
+            )
+        except Exception as exc:
+            cleanup_errors = []
+            for child_id, _ in worktrees:
+                if child_id in quarantined_ids:
+                    continue
+                try:
+                    self._wm.clean(task.id, child_id)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"{child_id}: {cleanup_exc}")
+            detail = f"delegation state transition failed: {exc}"
+            if cleanup_errors:
+                detail += f"; cleanup failed: {'; '.join(cleanup_errors)}"
+            if quarantined_ids:
+                detail += f"; quarantined workspaces: {sorted(quarantined_ids)}"
+            await record.mark_failed("delegation_state_failed")
+            return self._summary_delegation(
+                record, delegation_result, detail=detail, outcome="failed"
+            )
 
         if status == "completed":
-            if self._wm and integration_base is not None:
-                records = [
-                    wt_record for wt_record in self._wm.list_records()
-                    if wt_record.task_id == task.id
-                ]
+            records = [
+                wt_record for wt_record in self._wm.list_records()
+                if wt_record.task_id == task.id
+            ]
+            if read_only:
+                aggregate = delegation_result.aggregate_result
                 try:
-                    for wt_record in records:
-                        self._wm.commit_changes(task.id, wt_record.child_id)
-                        self._wm.integrate(task.id, wt_record.child_id)
-
-                    aggregate = delegation_result.aggregate_result
                     if aggregate is None:
                         raise RuntimeError("delegation produced no aggregate result")
                     integrated_eval = await self._eval_gate.run(task, aggregate, budget)
@@ -420,40 +706,156 @@ class Orchestrator:
                             check.name for check in integrated_eval.failed_checks()
                         )
                         raise RuntimeError(f"integrated eval failed: {failed}")
-                except Exception as exc:
-                    self._wm.rollback(integration_base)
-                    for wt_record in records:
-                        self._wm.abandon(task.id, wt_record.child_id)
-                    await record.mark_failed("integration_failed")
-                    return self._summary_delegation(
-                        record, delegation_result, detail=str(exc), outcome="failed"
+
+                    root_changes = (
+                        root_baseline.changed() if root_baseline else ["<root>"]
                     )
+                    child_changes = {
+                        child_id: baseline.changed()
+                        for child_id, baseline in worktree_baselines.items()
+                    }
+                    child_changes = {
+                        child_id: changes
+                        for child_id, changes in child_changes.items()
+                        if changes
+                    }
+                    if root_changes or child_changes:
+                        raise RuntimeError(
+                            "read-only final baseline mismatch: "
+                            f"root={root_changes}, children={child_changes}"
+                        )
+
+                    for wt_record in records:
+                        self._wm.clean(task.id, wt_record.child_id)
+                    await record.mark_completed()
+                except Exception as exc:
+                    cleanup_errors = []
+                    for wt_record in records:
+                        try:
+                            self._wm.clean(task.id, wt_record.child_id)
+                        except Exception as cleanup_exc:
+                            cleanup_errors.append(
+                                f"{wt_record.child_id}: {cleanup_exc}"
+                            )
+                    detail = str(exc)
+                    if cleanup_errors:
+                        detail += f"; cleanup failed: {'; '.join(cleanup_errors)}"
+                    await record.mark_failed("read_only_mutation")
+                    return self._summary_delegation(
+                        record,
+                        delegation_result,
+                        detail=detail,
+                        outcome="failed",
+                        verification_status="fail",
+                    )
+                return self._summary_delegation(
+                    record,
+                    delegation_result,
+                    files_changed=[],
+                    verification_status="pass",
+                )
+            try:
+                trusted_files: list[str] = []
+                for wt_record in records:
+                    child_files = trusted_changed_files(
+                        wt_record.worktree_path, base_sha=integration_base
+                    )
+                    if child_files is None:
+                        raise RuntimeError(
+                            f"could not derive trusted files for {wt_record.child_id}"
+                        )
+                    trusted_files.extend(child_files)
+                trusted_files = list(dict.fromkeys(trusted_files))
+
+                for wt_record in records:
+                    self._wm.commit_changes(task.id, wt_record.child_id)
+                    self._wm.integrate(task.id, wt_record.child_id)
+
+                aggregate = delegation_result.aggregate_result
+                if aggregate is None:
+                    raise RuntimeError("delegation produced no aggregate result")
+                integrated_eval = await self._eval_gate.run(task, aggregate, budget)
+                if integrated_eval.overall != EvalStatus.PASS:
+                    failed = ", ".join(
+                        check.name for check in integrated_eval.failed_checks()
+                    )
+                    raise RuntimeError(f"integrated eval failed: {failed}")
                 for wt_record in records:
                     self._wm.clean(task.id, wt_record.child_id)
-
-            await record.mark_completed()
-            return self._summary_delegation(record, delegation_result)
-
-        if status == "partial_failed":
-            if self._wm:
-                for wt_record in list(self._wm.list_records()):
-                    if wt_record.task_id == task.id:
-                        self._wm.abandon(task.id, wt_record.child_id)
-            await record.mark_failed("partial_children_failed")
+                await record.mark_completed()
+            except Exception as exc:
+                failures = []
+                try:
+                    self._wm.rollback(integration_base)
+                except Exception as rollback_exc:
+                    failures.append(f"rollback failed: {rollback_exc}")
+                for wt_record in records:
+                    try:
+                        self._wm.clean(task.id, wt_record.child_id)
+                    except Exception as cleanup_exc:
+                        failures.append(
+                            f"cleanup failed for {wt_record.child_id}: {cleanup_exc}"
+                        )
+                detail = str(exc)
+                if failures:
+                    detail += "; " + "; ".join(failures)
+                await record.mark_failed("integration_failed")
+                return self._summary_delegation(
+                    record,
+                    delegation_result,
+                    detail=detail,
+                    outcome="failed",
+                    verification_status="fail",
+                )
             return self._summary_delegation(
                 record,
                 delegation_result,
-                detail=f"{delegation_result.failed} of {len(delegation_result.children)} children failed; nothing integrated",
+                files_changed=trusted_files,
+                verification_status="pass",
+            )
+
+        if status == "partial_failed":
+            cleanup_errors = []
+            for child_id, _ in worktrees:
+                if child_id in quarantined_ids:
+                    continue
+                try:
+                    self._wm.clean(task.id, child_id)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"{child_id}: {cleanup_exc}")
+            await record.mark_failed("partial_children_failed")
+            detail = (
+                f"{delegation_result.failed} of {len(delegation_result.children)} "
+                "children failed; nothing integrated"
+            )
+            if cleanup_errors:
+                detail += f"; cleanup failed: {'; '.join(cleanup_errors)}"
+            if quarantined_ids:
+                detail += f"; quarantined workspaces: {sorted(quarantined_ids)}"
+            return self._summary_delegation(
+                record,
+                delegation_result,
+                detail=detail,
+                outcome="failed",
             )
 
         # All failed
+        cleanup_errors = []
+        for child_id, _ in worktrees:
+            if child_id in quarantined_ids:
+                continue
+            try:
+                self._wm.clean(task.id, child_id)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"{child_id}: {cleanup_exc}")
+        detail = "all delegation children failed"
+        if cleanup_errors:
+            detail += f"; cleanup failed: {'; '.join(cleanup_errors)}"
+        if quarantined_ids:
+            detail += f"; quarantined workspaces: {sorted(quarantined_ids)}"
         await record.mark_failed("all_children_failed")
-        if self._wm:
-            for wt_record in list(self._wm.list_records()):
-                if wt_record.task_id == task.id:
-                    self._wm.abandon(task.id, wt_record.child_id)
         return self._summary_delegation(
-            record, delegation_result, detail="all delegation children failed"
+            record, delegation_result, detail=detail, outcome="failed"
         )
 
     # ── Summary helpers ────────────────────────────────────────────────────────
@@ -464,6 +866,7 @@ class Orchestrator:
     ) -> dict:
         d: dict = {
             "task_id": record.task.id,
+            "run_id": record.run_id,
             "outcome": outcome,
             "route": record.route,
             "retry_count": record.retry_count,
@@ -475,6 +878,7 @@ class Orchestrator:
                 "overall": er.overall.value,
                 "failed_checks": [c.name for c in er.failed_checks()],
             }
+            d["verification_status"] = er.overall.value
         if "usage" in extra:
             u = extra["usage"]
             d["usage"] = {
@@ -483,6 +887,14 @@ class Orchestrator:
                 "total_tokens": u.total_tokens,
                 "estimated_cost_usd": u.estimated_cost_usd,
             }
+        for name in (
+            "files_changed",
+            "workspace_root",
+            "isolation_level",
+            "verification_status",
+        ):
+            if name in extra:
+                d[name] = extra[name]
         return d
 
     @staticmethod
@@ -491,23 +903,51 @@ class Orchestrator:
         dr: DelegationResult,
         detail: str = "",
         outcome: str | None = None,
+        **extra,
     ) -> dict:
+        child_runs = [
+            {"child_id": child.child_id, "run_id": run_id}
+            for child in dr.children
+            for run_id in child.attempt_run_ids
+        ]
+        evaluation_statuses = [
+            child.eval_result.overall.value
+            for child in dr.children
+            if child.eval_result is not None
+        ]
+        verification_status = extra.get("verification_status")
+        if verification_status is None:
+            if any(status == "fail" for status in evaluation_statuses):
+                verification_status = "fail"
+            elif dr.children and len(evaluation_statuses) == len(dr.children):
+                verification_status = "pass"
+        usage = None
+        total_input = dr.total_input_tokens
+        total_output = dr.total_output_tokens
+        if dr.children and total_input is not None and total_output is not None:
+            usage = {
+                "input_tokens": total_input,
+                "output_tokens": total_output,
+                "total_tokens": total_input + total_output,
+                "estimated_cost_usd": dr.total_cost_usd,
+            }
         return {
             "task_id": record.task.id,
+            "run_id": None,
             "outcome": outcome or dr.overall_status,
             "route": "delegation",
             "retry_count": record.retry_count,
             "detail": detail,
+            "child_runs": child_runs,
+            "files_changed": extra.get("files_changed"),
+            "workspace_root": None,
+            "isolation_level": "workspace",
+            "verification_status": verification_status,
             "delegation": {
                 "children": len(dr.children),
                 "successful": dr.successful,
                 "failed": dr.failed,
                 "duration_ms": dr.duration_ms,
             },
-            "usage": {
-                "input_tokens": dr.total_input_tokens,
-                "output_tokens": dr.total_output_tokens,
-                "total_tokens": dr.total_input_tokens + dr.total_output_tokens,
-                "estimated_cost_usd": dr.total_cost_usd,
-            },
+            "usage": usage,
         }

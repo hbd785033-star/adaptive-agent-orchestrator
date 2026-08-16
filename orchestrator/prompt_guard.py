@@ -17,7 +17,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
-from contracts.task import TaskContract, WorkspaceSpec
+from contracts.task import TaskContract, TaskType, WorkspaceSpec
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -75,6 +75,11 @@ def _build_constraints_block(
     lines.append("task to fail and trigger a retry.")
     lines.append("")
 
+    if task.task_type in {TaskType.CODE_REVIEW, TaskType.PARALLEL_RESEARCH}:
+        lines.append("### READ-ONLY EXECUTION")
+        lines.append("Do not create, modify, delete, move, or rename any repository file.")
+        lines.append("")
+
     # Workspace
     effective_path = str(worktree_path) if worktree_path else (
         task.workspace.path if task.workspace else None
@@ -106,7 +111,8 @@ def _build_constraints_block(
     if task.success_criteria:
         lines.append("### Success criteria (your output MUST satisfy all of these)")
         for i, c in enumerate(task.success_criteria, 1):
-            lines.append(f"  {i}. {c}")
+            rendered = c if isinstance(c, str) else c.model_dump_json(exclude_none=True)
+            lines.append(f"  {i}. {rendered}")
         lines.append("")
 
     # Output schema

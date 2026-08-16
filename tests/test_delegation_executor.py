@@ -274,6 +274,66 @@ class TestSelectiveRetry:
         assert child2 is not None
         assert child2.retry_count == 0
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("retry_scenario", ["pass", "fail"])
+    async def test_retry_retains_all_observed_attempt_run_ids(
+        self, tmp_path, retry_scenario
+    ):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("fail", error_message="first attempt")
+        adapter.enqueue_scenario(retry_scenario, error_message="second attempt")
+        child = make_task().model_copy(
+            update={"context": {"_child_id": "child-1"}}
+        )
+
+        executor = await build_executor(adapter, tmp_path)
+        result = await executor.execute(
+            "parent-retry-provenance",
+            [child],
+            make_budget(max_retries=1),
+        )
+
+        final = result.get_child("child-1")
+        assert final is not None
+        assert final.run_id == list(adapter._runs)[-1]
+        assert final.attempt_run_ids == list(adapter._runs)
+
+    @pytest.mark.asyncio
+    async def test_dag_retry_retains_all_observed_attempt_run_ids(self, tmp_path):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("pass", summary="dependency passed")
+        adapter.enqueue_scenario("fail", error_message="first attempt")
+        adapter.enqueue_scenario("pass", summary="retry passed")
+        seed = make_task().model_copy(
+            update={
+                "context": {
+                    "_child_id": "child-seed",
+                    "_subtask_id": "seed",
+                    "_dependencies": [],
+                }
+            }
+        )
+        first = make_task().model_copy(
+            update={
+                "context": {
+                    "_child_id": "child-1",
+                    "_subtask_id": "first",
+                    "_dependencies": ["seed"],
+                }
+            }
+        )
+
+        executor = await build_executor(adapter, tmp_path)
+        result = await executor.execute(
+            "parent-dag-provenance",
+            [seed, first],
+            make_budget(max_retries=1),
+        )
+
+        retried = result.get_child("child-1")
+        assert retried is not None
+        assert retried.attempt_run_ids == list(adapter._runs)[1:]
+
 
 # ── Test 8: overall_status logic ──────────────────────────────────────────────
 
