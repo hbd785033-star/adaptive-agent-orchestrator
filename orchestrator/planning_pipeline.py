@@ -28,6 +28,7 @@ from orchestrator.candidate_filter import (
     assess_candidates,
 )
 from orchestrator.execution_mode_policy import select_execution_mode
+from orchestrator.hmc_planner_consumer import HMCPlanningContext
 from orchestrator.runtime_plan_composer import compose_runtime_plan
 from orchestrator.runtime_selector import select_runtime
 
@@ -41,6 +42,7 @@ class PlanningResult(BaseModel):
     selection: RuntimeSelectionDecision
     mode: ExecutionModeDecision | None = None
     plan: RuntimePlan | None = None
+    hmc_context: HMCPlanningContext | None = None
 
     @model_validator(mode="after")
     def validate_consistency(self) -> PlanningResult:
@@ -68,6 +70,11 @@ class PlanningResult(BaseModel):
             raise ValueError("RuntimePlan executor must match selected runtime")
         if self.plan.execution_mode != self.mode.mode:
             raise ValueError("RuntimePlan mode must match execution-mode decision")
+        if (
+            self.hmc_context is not None
+            and self.plan.planner != self.hmc_context.planner_id
+        ):
+            raise ValueError("RuntimePlan planner must match HMC planning provenance")
         return self
 
 
@@ -82,6 +89,7 @@ def plan_runtime(
     planner: str | None = None,
     reviewer: str | None = None,
     approval_required: bool = False,
+    hmc_context: HMCPlanningContext | None = None,
 ) -> PlanningResult:
     """Run the deterministic planning chain without executing any runtime."""
     assessments = assess_candidates(requirements, candidates)
@@ -93,6 +101,7 @@ def plan_runtime(
             selection=selection,
             mode=None,
             plan=None,
+            hmc_context=hmc_context,
         )
 
     matches = [
@@ -119,13 +128,14 @@ def plan_runtime(
             selection=selection,
             mode=mode,
             plan=None,
+            hmc_context=hmc_context,
         )
 
     plan = compose_runtime_plan(
         selection,
         mode,
         plan_policy_version=plan_policy_version,
-        planner=planner,
+        planner=hmc_context.planner_id if hmc_context is not None else planner,
         reviewer=reviewer,
         approval_required=approval_required,
     )
@@ -134,4 +144,5 @@ def plan_runtime(
         selection=selection,
         mode=mode,
         plan=plan,
+        hmc_context=hmc_context,
     )
