@@ -44,23 +44,23 @@ class ExecutionRecord(BaseModel):
 
     schema_version: Literal["0.1"] = "0.1"
     task_id: str
-    run_id: str
-    model: str
-    provider: str
+    run_id: str | None = None
+    model: str | None = None
+    provider: str | None = None
     harness: str = "adaptive-agent-orchestrator"
     status: Literal["completed", "failed", "cancelled", "timeout"]
     started_at: datetime
     finished_at: datetime
     latency_seconds: float = Field(ge=0)
-    input_tokens: int = Field(ge=0)
-    output_tokens: int = Field(ge=0)
-    cached_tokens: int = Field(default=0, ge=0)
-    cost_usd: float = Field(default=0.0, ge=0)
-    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
-    files_changed: list[str] = Field(default_factory=list)
-    output: str = ""
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cached_tokens: int | None = Field(default=None, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+    tool_calls: list[dict[str, Any]] | None = None
+    files_changed: list[str] | None = None
+    output: str | None = None
     workspace_root: str | None = None
-    isolation_level: Literal["none", "workspace", "os"] = "none"
+    isolation_level: Literal["none", "workspace", "os"] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def export(self, destination: str | Path) -> Path:

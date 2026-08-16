@@ -14,6 +14,69 @@ app = typer.Typer(name="aao", help="Adaptive Agent Orchestrator — control plan
 console = Console()
 
 
+def _build_execution_record(
+    *,
+    task_id: str,
+    result: dict,
+    mock: bool,
+    started_at: datetime | str,
+    finished_at: datetime | str,
+):
+    """Build truthful evidence: absent observations remain explicitly unknown."""
+    from contracts.execution import ExecutionRecord
+
+    def as_datetime(value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    started = as_datetime(started_at)
+    finished = as_datetime(finished_at)
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
+    evaluation = result.get("eval") if isinstance(result.get("eval"), dict) else None
+
+    return ExecutionRecord(
+        task_id=task_id,
+        run_id=result.get("run_id"),
+        model="mock" if mock else None,
+        provider="fixture" if mock else None,
+        status="completed" if result.get("outcome") == "completed" else "failed",
+        started_at=started,
+        finished_at=finished,
+        latency_seconds=(finished - started).total_seconds(),
+        input_tokens=usage.get("input_tokens") if usage is not None else None,
+        output_tokens=usage.get("output_tokens") if usage is not None else None,
+        cached_tokens=usage.get("cached_tokens") if usage is not None else None,
+        cost_usd=usage.get("estimated_cost_usd") if usage is not None else None,
+        tool_calls=result.get("tool_calls") if "tool_calls" in result else None,
+        files_changed=(
+            list(result["files_changed"])
+            if isinstance(result.get("files_changed"), list)
+            else None
+        ),
+        output=(
+            str(result["detail"])
+            if result.get("detail") is not None
+            else str(result["summary"])
+            if result.get("summary") is not None
+            else None
+        ),
+        workspace_root=result.get("workspace_root"),
+        isolation_level=result.get("isolation_level"),
+        metadata={
+            "route": result.get("route"),
+            "retries": result.get("retry_count"),
+            "verification_status": (
+                result.get("verification_status")
+                if "verification_status" in result
+                else evaluation.get("overall") if evaluation is not None else None
+            ),
+            "child_runs": result.get("child_runs"),
+            "identity_observed": mock,
+        },
+    )
+
+
 @app.command()
 def run(
     goal: str = typer.Argument(..., help="Task goal"),
@@ -90,36 +153,13 @@ async def _run_task(**kwargs) -> None:  # noqa: ANN003
         result = await orch.run(task)
 
     if kwargs.get("record_out"):
-        from contracts.execution import ExecutionRecord
-
         finished_at = datetime.now(UTC)
-        usage = result.get("usage", {})
-        status = "completed" if result.get("outcome") == "completed" else "failed"
-        record = ExecutionRecord(
+        record = _build_execution_record(
             task_id=task.id,
-            run_id=str(result.get("run_id") or f"aao-{task.id}"),
-            model="mock" if kwargs["mock"] else "unknown",
-            provider="fixture" if kwargs["mock"] else "unknown",
-            status=status,
+            result=result,
+            mock=kwargs["mock"],
             started_at=started_at,
             finished_at=finished_at,
-            latency_seconds=(finished_at - started_at).total_seconds(),
-            input_tokens=int(usage.get("input_tokens", 0)),
-            output_tokens=int(usage.get("output_tokens", 0)),
-            cached_tokens=0,
-            cost_usd=float(usage.get("estimated_cost_usd") or 0.0),
-            tool_calls=[],
-            files_changed=list(result.get("files_changed", [])),
-            output=str(result.get("detail") or result.get("summary") or ""),
-            workspace_root=result.get("workspace_root"),
-            isolation_level=str(result.get("isolation_level", "none")),
-            metadata={
-                "route": result.get("route"),
-                "retries": result.get("retry_count", 0),
-                "verification_status": result.get("eval", {}).get("overall", "not_run"),
-                "trial": 1,
-                "identity_observed": kwargs["mock"],
-            },
         )
         record.export(kwargs["record_out"])
 

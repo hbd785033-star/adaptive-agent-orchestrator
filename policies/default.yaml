@@ -37,7 +37,9 @@ budget:
   require_approval_above_calls: 5
 
 approval:
-  # Actions that always require human confirmation before execution
+  # Only AAO-owned planned actions explicitly known before runtime.submit().
+  # This is NOT a veto over Hermes-native tool_start/tool_complete events;
+  # AgentRuntime.events() is observational and approval_request fails closed.
   always_require:
     - delete_files
     - deploy

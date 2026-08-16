@@ -305,6 +305,94 @@ class TestHermesAdapterContract:
         assert result.summary == "first"
         assert result.error is None
 
+    def test_terminal_result_without_usage_preserves_run_id_and_unknown_usage(self):
+        adapter = HermesAdapter()
+        handle = RunHandle(run_id="run-no-usage", task_id="task-no-usage")
+
+        adapter._record_event(handle, _parse_event({
+            "run_id": handle.run_id,
+            "type": "completed",
+            "payload": {"summary": "done without telemetry"},
+        }))
+
+        result = adapter._completed_results[handle.run_id]
+        assert result.run_id == "run-no-usage"
+        assert result.status == RunStatus.COMPLETED
+        assert result.usage is None
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            (
+                {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_cost_usd": 0.0,
+                },
+                (0, 0, 0, 0.0),
+            ),
+            ({"input_tokens": 100}, (100, None, None, None)),
+            (
+                {"input_tokens": 100, "output_tokens": 20},
+                (100, 20, 120, None),
+            ),
+        ],
+    )
+    def test_usage_event_preserves_zero_partial_and_derived_truth(
+        self, payload, expected
+    ):
+        adapter = HermesAdapter()
+        handle = RunHandle(run_id="run-usage", task_id="task-usage")
+
+        adapter._record_event(handle, _parse_event({
+            "run_id": handle.run_id,
+            "type": "usage",
+            "payload": payload,
+        }))
+        adapter._record_event(handle, _parse_event({
+            "run_id": handle.run_id,
+            "type": "completed",
+            "payload": {},
+        }))
+
+        usage = adapter._completed_results[handle.run_id].usage
+        assert usage is not None
+        assert (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            usage.estimated_cost_usd,
+        ) == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("rpc_result", "expected"),
+        [
+            ({}, (None, None, None, None)),
+            ({"input_tokens": 0, "output_tokens": 0}, (0, 0, 0, None)),
+            ({"input_tokens": 7}, (7, None, None, None)),
+            ({"input_tokens": 7, "output_tokens": 3}, (7, 3, 10, None)),
+        ],
+    )
+    async def test_usage_rpc_preserves_missing_fields(self, rpc_result, expected):
+        class UsageAdapter(HermesAdapter):
+            async def _call(self, method, params):
+                assert method == "session.usage"
+                assert params == {"run_id": "run-rpc"}
+                return rpc_result
+
+        usage = await UsageAdapter().usage(
+            RunHandle(run_id="run-rpc", task_id="task-rpc")
+        )
+
+        assert (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            usage.estimated_cost_usd,
+        ) == expected
+
 
 class TestMockAdapter:
     @pytest.mark.asyncio

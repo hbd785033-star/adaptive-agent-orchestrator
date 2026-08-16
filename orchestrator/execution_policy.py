@@ -29,23 +29,38 @@ class ExecutionPolicy:
     max_total_calls: int = 8
     approval_timeout_s: float = 120
 
-    def authorize_event(
+    def reject_runtime_approval_request(
         self,
         task: TaskContract,
-        event: dict,
         *,
         calls_used: int,
         approval: bool | None = None,
     ) -> PolicyDecision:
-        """Authorize one next call/event; exact limit means no further call fits."""
+        """Runtime events are observational; an approval request cannot resume in R2."""
+        del task, calls_used, approval
+        return PolicyDecision(
+            False,
+            ApprovalOutcome.DENIED,
+            "runtime approval requests fail closed; no resume capability",
+        )
+
+    def authorize_submission(
+        self,
+        task: TaskContract,
+        *,
+        calls_used: int,
+        planned_actions: set[str] | None = None,
+        approval: bool | None = None,
+    ) -> PolicyDecision:
+        """Authorize known AAO-owned inputs before runtime submission."""
+        del task
         if calls_used >= self.max_total_calls:
             return PolicyDecision(False, ApprovalOutcome.BUDGET_EXCEEDED, "call budget exhausted")
-        action = str(event.get("action", ""))
-        requires = (
-            action in self.always_require_actions
-            or calls_used >= self.require_approval_above_calls
+        protected_action = bool(
+            (planned_actions or set()).intersection(self.always_require_actions)
         )
-        if not requires:
+        protected_call = calls_used >= self.require_approval_above_calls
+        if not protected_action and not protected_call:
             return PolicyDecision(True, ApprovalOutcome.ALLOWED)
         if approval is True:
             return PolicyDecision(True, ApprovalOutcome.APPROVED)

@@ -129,9 +129,20 @@ agent-eval evaluate execution-record.json --dataset path/to/dataset.yaml
 ```
 
 所有写任务，包括 `single` 路由，都先在 Git worktree 中执行。只有 safety、
-policy 与 outcome verification 全部通过后才集成到 root；失败、运行时异常或
-评估异常会丢弃 staging workspace，root 保持不变。只读任务若产生可信 Git diff
-则直接失败。
+policy 与 outcome verification 全部通过后才集成到 root。失败或异常后，AAO
+必须先确认 runtime 已终止，才会回滚并删除 staging workspace；若无法确认终止，
+workspace 会保留为 quarantined，而不会虚报 cleanup 成功。只读任务在最终验证后
+若产生 repository mutation 则直接失败。
+
+### R2 approval capability boundary
+
+AAO 能在 `runtime.submit()` **之前**执行 task-risk approval、call-threshold
+approval，以及对AAO已明确拥有的planned action做submission gate。`AgentRuntime.events()`
+是observational event stream，不是同步pause/veto/ack/resume协议；因此AAO不声称能
+事前阻止Hermes-native tool calls。若runtime发出`approval_request`，R2固定fail
+closed：cancel run、确认terminal/quiesced、然后令execution失败；CLI affirmative
+answer也不会被描述为让该runtime继续。`tool_start`/`tool_complete`仅作审计证据，
+runtime-native tool governance仍属于runtime。
 
 | 层 | 职责 | 关键文件 |
 |---|---|---|
