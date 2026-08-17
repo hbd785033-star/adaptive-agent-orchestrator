@@ -16,6 +16,7 @@ dependencies = [
     "rich>=13.0",
     "structlog>=24.0",
     "anyio>=4.0",
+    "hermes-model-council @ git+https://github.com/hbd785033-star/hermes-model-council.git@b73d5bcd96666b331d0fe435d41146311c25987d",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +30,9 @@ dev = [
     "ruff>=0.4",
     "anyio[trio]>=4.0",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["aao_cli", "contracts", "adapters", "orchestrator", "evals", "storage", "telemetry", "spike"]
