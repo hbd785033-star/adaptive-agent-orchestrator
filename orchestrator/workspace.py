@@ -1,20 +1,21 @@
 """
-WorkspaceManager — Git worktree lifecycle for code-writing delegation tasks.
+WorkspaceManager — Git worktree lifecycle for repository-backed tasks.
 
 States:
     ALLOCATED → ACTIVE → MERGING → CLEANED
-                       ↘ ABANDONED          (eval fail; keep for inspection)
+                       ↘ ABANDONED          (observable cleanup failure only)
 
 Rules:
-    - Read-only task types (research, review) → no worktree allocated.
-    - Every writing child agent gets exactly one isolated worktree + branch.
+    - Every runtime execution gets exactly one isolated worktree + branch.
     - Orchestrator allocates the path and injects it into TaskContract.workspace.
-    - Cleanup of ABANDONED worktrees requires explicit human confirmation.
+    - Failure paths never claim CLEANED without verified artifact removal.
 """
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
+import os
 import re
 import subprocess
 from collections.abc import Iterator
@@ -26,6 +27,219 @@ import yaml
 
 class WorkspaceUnavailableError(RuntimeError):
     """Raised when a write task cannot obtain a safe Git workspace."""
+
+
+@dataclasses.dataclass(frozen=True)
+class RepositoryBaseline:
+    """Frozen Git and filesystem evidence used for final read-only enforcement."""
+
+    repo_path: Path
+    excluded_paths: tuple[str, ...]
+    protected_paths: tuple[str, ...]
+    head: str
+    symbolic_head: str | None
+    refs: tuple[tuple[str, str], ...]
+    objects: tuple[tuple[str, str], ...]
+    worktrees: tuple[tuple[str, ...], ...]
+    protected: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
+    index_entries: str
+    index_flags: str
+    tracked: tuple[tuple[str, str], ...]
+    untracked: tuple[tuple[str, str], ...]
+    ignored: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def capture(
+        cls,
+        repo_path: str | Path,
+        *,
+        excluded_paths: tuple[str, ...] = (),
+        protected_paths: tuple[str | Path, ...] = (),
+    ) -> RepositoryBaseline:
+        repo = Path(repo_path).resolve()
+        normalized_exclusions = tuple(
+            item.replace("\\", "/").strip("/") for item in excluded_paths if item
+        )
+        normalized_protected = tuple(
+            str(Path(item).resolve()) for item in protected_paths
+        )
+
+        def excluded(name: str) -> bool:
+            normalized = name.replace("\\", "/")
+            while normalized.startswith("./"):
+                normalized = normalized[2:]
+            normalized = normalized.rstrip("/")
+            return any(
+                normalized == prefix or normalized.startswith(f"{prefix}/")
+                for prefix in normalized_exclusions
+            )
+
+        def names(args: list[str]) -> list[str]:
+            return [
+                name
+                for name in _git(repo, args).split("\0")
+                if name and not excluded(name)
+            ]
+
+        def fingerprints(paths: list[str]) -> tuple[tuple[str, str], ...]:
+            return tuple(
+                sorted((name, _fingerprint(repo / name)) for name in paths)
+            )
+
+        tracked_names = names(["ls-files", "-z"])
+        untracked_names = names(
+            ["ls-files", "--others", "--exclude-standard", "-z"]
+        )
+        ignored_names = names(
+            ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]
+        )
+        return cls(
+            repo_path=repo,
+            excluded_paths=normalized_exclusions,
+            protected_paths=normalized_protected,
+            head=_git(repo, ["rev-parse", "HEAD"]).strip(),
+            symbolic_head=_symbolic_head(repo),
+            refs=_refs_snapshot(repo),
+            objects=_object_store_snapshot(repo),
+            worktrees=_worktree_snapshot(repo),
+            protected=tuple(
+                (path, _tree_snapshot(Path(path)))
+                for path in normalized_protected
+            ),
+            index_entries=_git(repo, ["ls-files", "--stage", "-z"]),
+            index_flags=_git(repo, ["ls-files", "-v", "-z"]),
+            tracked=fingerprints(tracked_names),
+            untracked=fingerprints(untracked_names),
+            ignored=fingerprints(ignored_names),
+        )
+
+    def changed(self) -> list[str]:
+        current = type(self).capture(
+            self.repo_path,
+            excluded_paths=self.excluded_paths,
+            protected_paths=self.protected_paths,
+        )
+        changed: list[str] = []
+        if current.head != self.head:
+            changed.append("<HEAD>")
+        if current.symbolic_head != self.symbolic_head:
+            changed.append("<symbolic-HEAD>")
+        if current.refs != self.refs:
+            changed.append("<refs>")
+        if current.objects != self.objects:
+            changed.append("<objects>")
+        if current.worktrees != self.worktrees:
+            changed.append("<worktrees>")
+        if current.protected != self.protected:
+            changed.append("<internal-worktrees>")
+        if current.index_entries != self.index_entries:
+            changed.append("<index>")
+        if current.index_flags != self.index_flags:
+            changed.append("<index-flags>")
+        for before, after in (
+            (dict(self.tracked), dict(current.tracked)),
+            (dict(self.untracked), dict(current.untracked)),
+            (dict(self.ignored), dict(current.ignored)),
+        ):
+            changed.extend(
+                name
+                for name in sorted(before.keys() | after.keys())
+                if before.get(name) != after.get(name)
+            )
+        return list(dict.fromkeys(changed))
+
+
+def _fingerprint(path: Path) -> str:
+    if path.is_symlink():
+        return "symlink:" + os.readlink(path)
+    if not path.exists():
+        return "<missing>"
+    if path.is_dir():
+        return "<directory>"
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _symbolic_head(repo: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "symbolic-ref", "-q", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    if result.returncode == 1:
+        return None
+    raise RuntimeError(f"git symbolic-ref -q HEAD failed:\n{result.stderr}")
+
+
+def _refs_snapshot(repo: Path) -> tuple[tuple[str, str], ...]:
+    output = _git(
+        repo,
+        [
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)%09%(objectname)",
+        ],
+    )
+    return tuple(
+        tuple(line.split("\t", 1))
+        for line in output.splitlines()
+        if line
+    )
+
+
+def _object_store_snapshot(repo: Path) -> tuple[tuple[str, str], ...]:
+    raw = _git(repo, ["rev-parse", "--git-common-dir"]).strip()
+    common_dir = Path(raw)
+    if not common_dir.is_absolute():
+        common_dir = (repo / common_dir).resolve()
+    return _tree_snapshot(common_dir / "objects", ignore_transient=True)
+
+
+def _worktree_snapshot(repo: Path) -> tuple[tuple[str, ...], ...]:
+    output = _git(repo, ["worktree", "list", "--porcelain"])
+    records: list[tuple[str, ...]] = []
+    for block in re.split(r"\n\s*\n", output.strip()):
+        fields: list[str] = []
+        for line in block.splitlines():
+            key, separator, value = line.partition(" ")
+            if key == "worktree" and separator:
+                value = Path(value).resolve().as_posix()
+            fields.append(f"{key} {value}".rstrip())
+        if fields:
+            records.append(tuple(fields))
+    return tuple(sorted(records))
+
+
+def _tree_snapshot(
+    root: Path,
+    *,
+    ignore_transient: bool = False,
+) -> tuple[tuple[str, str], ...]:
+    if not root.exists():
+        return (("<root>", "<missing>"),)
+    entries: list[tuple[str, str]] = []
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        directories.sort()
+        filenames.sort()
+        current_path = Path(current)
+        for name in list(directories):
+            path = current_path / name
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                entries.append((relative, _fingerprint(path)))
+                directories.remove(name)
+            else:
+                entries.append((relative + "/", "<directory>"))
+        for name in filenames:
+            if ignore_transient and (
+                name.endswith(".lock") or name.startswith("tmp_obj_")
+            ):
+                continue
+            path = current_path / name
+            entries.append((path.relative_to(root).as_posix(), _fingerprint(path)))
+    return tuple(entries)
 
 
 @dataclasses.dataclass
@@ -55,6 +269,7 @@ class ExecutionWorkspace:
             )
         _validate_identifier(task_id, "task_id")
         _validate_identifier(execution_id, "execution_id")
+        _assert_no_merge_state(repo)
         dirty = _git(repo, ["status", "--porcelain", "--untracked-files=all"])
         if dirty.strip():
             raise WorkspaceUnavailableError("root repository must be clean before execution")
@@ -62,6 +277,7 @@ class ExecutionWorkspace:
         root = Path(base_path)
         if not root.is_absolute():
             root = repo / root
+        _exclude_repo_path(repo, root)
         path = root / task_id / execution_id
         branch = f"agent/{task_id}/{execution_id}"
         base_sha = _git(repo, ["rev-parse", "HEAD"]).strip()
@@ -69,7 +285,11 @@ class ExecutionWorkspace:
         try:
             _git(repo, ["worktree", "add", "-b", branch, str(path), base_sha])
         except RuntimeError as exc:
-            raise WorkspaceUnavailableError(str(exc)) from exc
+            cleanup_errors = _remove_workspace_artifacts(repo, path, branch)
+            detail = str(exc)
+            if cleanup_errors:
+                detail += "; allocation cleanup failed: " + "; ".join(cleanup_errors)
+            raise WorkspaceUnavailableError(detail) from exc
         return cls(
             repo_path=repo,
             path=path,
@@ -85,12 +305,18 @@ class ExecutionWorkspace:
         return self.path
 
     def changed_files(self) -> list[str]:
-        """Return the trusted Git diff, including untracked files."""
+        """Return the trusted base-relative diff, including ignored mutations."""
         diff = _git(self.path, ["diff", "--name-only", "-z", self.base_sha])
         untracked = _git(
             self.path, ["ls-files", "--others", "--exclude-standard", "-z"]
         )
-        return list(dict.fromkeys(name for name in (diff + untracked).split("\0") if name))
+        ignored = _git(
+            self.path,
+            ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+        )
+        return list(
+            dict.fromkeys(name for name in (diff + untracked + ignored).split("\0") if name)
+        )
 
     def integrate(self) -> None:
         """Commit and merge this workspace, rolling back on any error."""
@@ -126,10 +352,10 @@ class ExecutionWorkspace:
                     f"integrate {self.task_id}/{self.execution_id}",
                 ],
             )
+            self.cleanup()
         except Exception:
             self.rollback()
             raise
-        self.cleanup()
 
     def rollback(self) -> None:
         """Restore the integration base and remove all execution artifacts."""
@@ -140,16 +366,22 @@ class ExecutionWorkspace:
         current = _git(self.repo_path, ["rev-parse", "HEAD"]).strip()
         if current != self.base_sha:
             _git(self.repo_path, ["reset", "--merge", self.base_sha])
+        _assert_no_merge_state(self.repo_path)
+        dirty = _git(
+            self.repo_path, ["status", "--porcelain", "--untracked-files=all"]
+        )
+        if dirty.strip():
+            raise RuntimeError("root repository is not clean after rollback")
         self.cleanup()
 
     def cleanup(self) -> None:
-        """Idempotently remove the worktree and its temporary branch."""
+        """Remove all artifacts and claim success only after postcondition checks."""
         if self.cleaned:
             return
-        with contextlib.suppress(RuntimeError):
-            _git(self.repo_path, ["worktree", "remove", "--force", str(self.path)])
-        with contextlib.suppress(RuntimeError):
-            _git(self.repo_path, ["branch", "-D", self.branch])
+        _assert_no_merge_state(self.repo_path)
+        errors = _remove_workspace_artifacts(self.repo_path, self.path, self.branch)
+        if errors:
+            raise RuntimeError("workspace cleanup failed: " + "; ".join(errors))
         self.cleaned = True
 
 
@@ -242,17 +474,7 @@ class WorkspaceManager:
 
     def _exclude_internal_worktrees(self) -> None:
         """Keep internal worktrees out of trusted root changed-file scans."""
-        try:
-            relative = self._base.resolve().relative_to(self._repo.resolve())
-        except ValueError:
-            return
-        exclude_file = self._repo / ".git" / "info" / "exclude"
-        if not exclude_file.parent.exists():
-            return
-        pattern = f"/{relative.as_posix().rstrip('/')}/"
-        existing = exclude_file.read_text(errors="ignore") if exclude_file.exists() else ""
-        if pattern not in existing.splitlines():
-            exclude_file.write_text(existing.rstrip("\n") + f"\n{pattern}\n")
+        _exclude_repo_path(self._repo, self._base)
 
     def needs_worktree(self, task_type: str) -> bool:
         return task_type not in self._readonly_types
@@ -268,9 +490,7 @@ class WorkspaceManager:
             existing = self._records[key]
             if existing.status == WorktreeStatus.ABANDONED:
                 # Stale from a previous failed run — clean up before re-creating
-                _git(self._repo, ["worktree", "remove", "--force", str(existing.worktree_path)])
-                with contextlib.suppress(RuntimeError):
-                    _git(self._repo, ["branch", "-D", existing.branch])
+                self.clean(task_id, child_id)
                 del self._records[key]
             else:
                 raise ValueError(
@@ -284,7 +504,19 @@ class WorkspaceManager:
         # Do NOT `git checkout -b` first — that checks the branch out in the main
         # worktree and causes `git worktree add` to fail with "already used by worktree".
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        _git(self._repo, ["worktree", "add", "-b", branch, str(worktree_path), "HEAD"])
+        try:
+            _git(
+                self._repo,
+                ["worktree", "add", "-b", branch, str(worktree_path), "HEAD"],
+            )
+        except RuntimeError as exc:
+            cleanup_errors = _remove_workspace_artifacts(
+                self._repo, worktree_path, branch
+            )
+            detail = str(exc)
+            if cleanup_errors:
+                detail += "; allocation cleanup failed: " + "; ".join(cleanup_errors)
+            raise RuntimeError(detail) from exc
 
         record = WorktreeRecord(
             task_id=task_id,
@@ -318,6 +550,10 @@ class WorkspaceManager:
         with contextlib.suppress(RuntimeError):
             _git(self._repo, ["merge", "--abort"])
         _git(self._repo, ["reset", "--merge", base_sha])
+        if self.current_head() != base_sha:
+            raise RuntimeError("root rollback could not restore integration base")
+        _assert_no_merge_state(self._repo)
+        self.ensure_root_clean()
 
     def commit_changes(self, task_id: str, child_id: str) -> str:
         """Commit all child worktree changes and return the child branch tip."""
@@ -366,9 +602,14 @@ class WorkspaceManager:
         ABANDONED worktrees are NEVER auto-cleaned — this must be called explicitly.
         """
         record = self._get(task_id, child_id)
-        _git(self._repo, ["worktree", "remove", "--force", str(record.worktree_path)])
-        with contextlib.suppress(RuntimeError):
-            _git(self._repo, ["branch", "-D", record.branch])
+        if record.status == WorktreeStatus.CLEANED:
+            return
+        _assert_no_merge_state(self._repo)
+        errors = _remove_workspace_artifacts(
+            self._repo, record.worktree_path, record.branch
+        )
+        if errors:
+            raise RuntimeError("workspace cleanup failed: " + "; ".join(errors))
         record.status = WorktreeStatus.CLEANED
 
     def list_records(self) -> Iterator[WorktreeRecord]:
@@ -391,3 +632,88 @@ def _git(repo: Path, args: list[str]) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed:\n{result.stderr}")
     return result.stdout
+
+
+def _git_ref_exists(repo: Path, ref: str) -> bool:
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", ref,
+        ], cwd=repo, capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise RuntimeError(
+        f"git ref probe failed ({result.returncode}) for {ref}: {result.stderr.strip()}"
+    )
+
+
+def _worktree_registered(repo: Path, path: Path) -> bool:
+    target = path.resolve()
+    output = _git(repo, ["worktree", "list", "--porcelain"])
+    return any(
+        Path(line.removeprefix("worktree ")).resolve() == target
+        for line in output.splitlines()
+        if line.startswith("worktree ")
+    )
+
+
+def _assert_no_merge_state(repo: Path) -> None:
+    active: list[str] = []
+    for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
+        raw = _git(repo, ["rev-parse", "--git-path", marker]).strip()
+        marker_path = Path(raw)
+        if not marker_path.is_absolute():
+            marker_path = repo / marker_path
+        if marker_path.exists():
+            active.append(marker)
+    if active:
+        raise RuntimeError(f"root repository has active merge state: {', '.join(active)}")
+
+
+def _exclude_repo_path(repo: Path, path: Path) -> None:
+    """Exclude AAO-owned worktree storage from root status calculations."""
+    try:
+        relative = path.resolve().relative_to(repo.resolve())
+    except ValueError:
+        return
+    exclude_file = repo / ".git" / "info" / "exclude"
+    if not exclude_file.parent.exists():
+        return
+    pattern = f"/{relative.as_posix().rstrip('/')}/"
+    existing = exclude_file.read_text(errors="ignore") if exclude_file.exists() else ""
+    if pattern not in existing.splitlines():
+        exclude_file.write_text(existing.rstrip("\n") + f"\n{pattern}\n")
+
+
+def _remove_workspace_artifacts(repo: Path, path: Path, branch: str) -> list[str]:
+    """Best-effort every removal, then return all command/postcondition failures."""
+    errors: list[str] = []
+    if path.exists():
+        try:
+            _git(repo, ["worktree", "remove", "--force", str(path)])
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    try:
+        branch_exists = _git_ref_exists(repo, f"refs/heads/{branch}")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        branch_exists = False
+    if branch_exists:
+        try:
+            _git(repo, ["branch", "-D", branch])
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    if path.exists():
+        errors.append(f"worktree path still exists: {path}")
+    try:
+        if _worktree_registered(repo, path):
+            errors.append(f"worktree still registered: {path}")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+    try:
+        if _git_ref_exists(repo, f"refs/heads/{branch}"):
+            errors.append(f"temporary branch still exists: {branch}")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+    return errors

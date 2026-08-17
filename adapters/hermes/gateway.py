@@ -46,6 +46,24 @@ _TYPED_PARSERS = {
 }
 
 
+def _usage_from_evidence(evidence: dict[str, Any]) -> Usage:
+    input_tokens = evidence.get("input_tokens")
+    output_tokens = evidence.get("output_tokens")
+    total_tokens = evidence.get("total_tokens")
+    if (
+        "total_tokens" not in evidence
+        and input_tokens is not None
+        and output_tokens is not None
+    ):
+        total_tokens = input_tokens + output_tokens
+    return Usage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        estimated_cost_usd=evidence.get("estimated_cost_usd"),
+    )
+
+
 def _parse_event(raw: dict) -> AgentEvent:
     event = AgentEvent(
         id=raw.get("id", uuid.uuid4().hex),
@@ -265,7 +283,7 @@ class HermesAdapter:
             "files_changed": [],
             "summary": "",
             "error": None,
-            "usage": Usage(),
+            "usage": None,
             "status": RunStatus.RUNNING,
         }
         disconnected_during_submit = (
@@ -336,7 +354,7 @@ class HermesAdapter:
             return
         state = self._run_state.setdefault(handle.run_id, {
             "files_changed": [], "summary": "", "error": None,
-            "usage": Usage(), "status": RunStatus.RUNNING,
+            "usage": None, "status": RunStatus.RUNNING,
         })
         if event.type == "completed":
             if isinstance(event.typed_payload, CompletedPayload):
@@ -349,15 +367,7 @@ class HermesAdapter:
         elif event.type == "tool_complete" and isinstance(event.typed_payload, ToolCompletePayload):
             state["files_changed"].extend(event.typed_payload.files_written)
         elif event.type == "usage":
-            state["usage"] = Usage(
-                input_tokens=event.payload.get("input_tokens", 0),
-                output_tokens=event.payload.get("output_tokens", 0),
-                total_tokens=event.payload.get(
-                    "total_tokens",
-                    event.payload.get("input_tokens", 0) + event.payload.get("output_tokens", 0),
-                ),
-                estimated_cost_usd=event.payload.get("estimated_cost_usd"),
-            )
+            state["usage"] = _usage_from_evidence(event.payload)
         elif event.type == "error":
             state["error"] = (
                 event.typed_payload.message
@@ -400,12 +410,7 @@ class HermesAdapter:
 
     async def usage(self, handle: RunHandle) -> Usage:
         result = await self._call("session.usage", {"run_id": handle.run_id})
-        return Usage(
-            input_tokens=result.get("input_tokens", 0),
-            output_tokens=result.get("output_tokens", 0),
-            total_tokens=result.get("total_tokens", 0),
-            estimated_cost_usd=result.get("estimated_cost_usd"),
-        )
+        return _usage_from_evidence(result)
 
     async def cancel(self, handle: RunHandle) -> None:
         await self._call("session.interrupt", {"run_id": handle.run_id})
