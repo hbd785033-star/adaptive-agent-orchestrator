@@ -9,19 +9,30 @@ Flow per task:
 """
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Callable
+from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
+from model_council.inventory import ModelSpec, discover_models
 
 from adapters.runtime import AgentRuntime
 from contracts.delegation import DelegationResult
 from contracts.evaluation import EvalStatus
+from contracts.execution_mode import ExecutionModePolicy
 from contracts.result import RunStatus
+from contracts.runtime_health import HealthStatus, RuntimeHealth
+from contracts.runtime_selection import RuntimeSelectionPolicy
 from contracts.task import TaskContract
 from evals.gate import DeterministicEvalGate, trusted_changed_files
 from orchestrator.budget import ApprovalGate, BudgetConfig, BudgetState
+from orchestrator.candidate_filter import RuntimeCandidate
 from orchestrator.delegation_executor import DelegationExecutor
 from orchestrator.execution_policy import ExecutionPolicy
+from orchestrator.hmc_planning import HMCPlanningEvidence, build_hmc_planning
+from orchestrator.planning_pipeline import PlanningResult, plan_runtime
 from orchestrator.profiler import TaskProfiler
 from orchestrator.prompt_guard import inject_constraints, split_for_delegation
 from orchestrator.router import RuleRouter
@@ -35,6 +46,41 @@ from storage.database import Database
 from telemetry.events import TelemetryRecorder
 
 log = structlog.get_logger(__name__)
+
+
+def _planning_payload(
+    evidence: HMCPlanningEvidence,
+    planning_result: PlanningResult,
+) -> dict:
+    context = evidence.context
+    return {
+        "task_profile": evidence.intake.profile.model_dump(mode="json"),
+        "requirements": evidence.intake.requirements.model_dump(mode="json"),
+        "hmc": {
+            "request_type": type(context.request).__name__,
+            "recommendation_type": type(context.recommendation).__name__,
+            "request_contract_version": context.request.contract_version,
+            "request_task_profile": asdict(context.request.task_profile),
+            "mapping_policy_version": context.mapping_policy_version,
+            "planner_id": context.planner_id,
+            "recommendation": asdict(context.recommendation),
+        },
+        "candidate_assessments": [
+            assessment.model_dump(mode="json")
+            for assessment in planning_result.assessments
+        ],
+        "runtime_selection": planning_result.selection.model_dump(mode="json"),
+        "execution_mode": (
+            planning_result.mode.model_dump(mode="json")
+            if planning_result.mode is not None
+            else None
+        ),
+        "runtime_plan": (
+            planning_result.plan.model_dump(mode="json")
+            if planning_result.plan is not None
+            else None
+        ),
+    }
 
 
 class Orchestrator:
@@ -59,6 +105,8 @@ class Orchestrator:
         eval_gate: DeterministicEvalGate,
         workspace_manager: WorkspaceManager | None,
         telemetry: TelemetryRecorder,
+        runtime_health: RuntimeHealth | None = None,
+        model_discoverer: Callable[[], list[ModelSpec]] | None = None,
     ) -> None:
         self._runtime = runtime
         self._db = db
@@ -75,6 +123,9 @@ class Orchestrator:
         self._eval_gate = eval_gate
         self._wm = workspace_manager
         self._tel = telemetry
+        self._runtime_health = runtime_health
+        self._planning_required = callable(getattr(runtime, "connect", None))
+        self._model_discoverer = model_discoverer or discover_models
         self._delegation_executor = DelegationExecutor(
             runtime=runtime,
             eval_gate=eval_gate,
@@ -89,6 +140,7 @@ class Orchestrator:
         db_path: str = "data/orchestrator.db",
         repo_path: str = ".",
         policy_path: str = "policies/default.yaml",
+        model_discoverer: Callable[[], list[ModelSpec]] | None = None,
     ) -> Orchestrator:
         import yaml
 
@@ -124,6 +176,27 @@ class Orchestrator:
             except Exception:
                 log.warning("workspace_manager_init_failed", repo_path=repo_path)
 
+        runtime_health: RuntimeHealth | None = None
+        connect = getattr(runtime, "connect", None)
+        if callable(connect):
+            checked_at = datetime.now(UTC)
+            try:
+                await connect()
+            except Exception as exc:
+                runtime_health = RuntimeHealth(
+                    runtime="hermes",
+                    status=HealthStatus.UNAVAILABLE,
+                    reasons=[f"Hermes Gateway connection failed: {exc}"],
+                    checked_at=checked_at,
+                )
+            else:
+                runtime_health = RuntimeHealth(
+                    runtime="hermes",
+                    status=HealthStatus.AVAILABLE,
+                    reasons=["Hermes Gateway connect succeeded"],
+                    checked_at=checked_at,
+                )
+
         return cls(
             runtime=runtime,
             db=db,
@@ -135,10 +208,59 @@ class Orchestrator:
             eval_gate=DeterministicEvalGate(repo_path),
             workspace_manager=workspace_manager,
             telemetry=TelemetryRecorder(db),
+            runtime_health=runtime_health,
+            model_discoverer=model_discoverer,
         )
 
     async def close(self) -> None:
-        await self._db.close()
+        disconnect = getattr(self._runtime, "disconnect", None)
+        try:
+            if callable(disconnect):
+                with contextlib.suppress(Exception):
+                    await disconnect()
+        finally:
+            await self._db.close()
+
+    async def _prepare_hmc_planning(
+        self,
+        task: TaskContract,
+    ) -> tuple[HMCPlanningEvidence, PlanningResult] | None:
+        """Prepare HMC evidence and an AAO plan before runtime submission."""
+        if self._runtime_health is None:
+            raise RuntimeError(
+                "runtime health is unavailable; executable planning is required "
+                "before Hermes submission"
+            )
+        if self._runtime_health.status != HealthStatus.AVAILABLE:
+            raise RuntimeError(
+                "Hermes runtime health is not available: "
+                + "; ".join(self._runtime_health.reasons)
+            )
+
+        evidence = build_hmc_planning(
+            task,
+            model_discoverer=self._model_discoverer,
+        )
+        capabilities = await self._runtime.capabilities()
+        candidate = RuntimeCandidate(
+            runtime="hermes",
+            capabilities=capabilities,
+            health=self._runtime_health,
+        )
+        planning_result = plan_runtime(
+            evidence.intake.profile,
+            evidence.intake.requirements,
+            [candidate],
+            RuntimeSelectionPolicy(
+                policy_version="runtime-selection-v1",
+                runtime_priority=("hermes",),
+                allow_degraded_fallback=False,
+            ),
+            ExecutionModePolicy(policy_version="execution-mode-v1"),
+            plan_policy_version="runtime-plan-v1",
+            hmc_context=evidence.context,
+        )
+        return evidence, planning_result
 
     def _capture_root_baseline(self) -> RepositoryBaseline:
         if self._wm is None:
@@ -254,6 +376,54 @@ class Orchestrator:
                 await record.mark_abandoned("user declined approval")
                 return self._summary(record, "abandoned", "declined by user")
 
+        planning_evidence: HMCPlanningEvidence | None = None
+        planning_result: PlanningResult | None = None
+        if self._planning_required and not task.subtasks:
+            if self._runtime_health is None:
+                await record.mark_failed("planning_failed")
+                return self._summary(
+                    record,
+                    "failed",
+                    "runtime health is unavailable; executable planning is required before Hermes submission",
+                )
+            try:
+                prepared = await self._prepare_hmc_planning(task)
+                if prepared is not None:
+                    planning_evidence, planning_result = prepared
+            except Exception as exc:
+                await record.mark_failed("planning_failed")
+                return self._summary(
+                    record,
+                    "failed",
+                    f"HMC/AAO planning failed: {exc}",
+                )
+            if planning_result is None or planning_result.plan is None:
+                await record.mark_failed("planning_failed")
+                return self._summary(
+                    record,
+                    "failed",
+                    "HMC/AAO planning produced no executable RuntimePlan",
+                    planning_evidence=planning_evidence,
+                    planning_result=planning_result,
+                )
+            if planning_result.plan.executor != "hermes":
+                await record.mark_failed("planning_failed")
+                return self._summary(
+                    record,
+                    "failed",
+                    "HMC/AAO planning selected a non-Hermes executor",
+                    planning_evidence=planning_evidence,
+                    planning_result=planning_result,
+                )
+
+        if self._planning_required and task.subtasks:
+            await record.mark_failed("planning_failed")
+            return self._summary(
+                record,
+                "failed",
+                "planned delegation execution is not available",
+            )
+
         # 4. Pre-flight: subtask count vs budget
         if (
             decision.route == "delegation"
@@ -283,10 +453,40 @@ class Orchestrator:
 
         # ── Branch: DELEGATION ─────────────────────────────────────────────────
         if decision.route == "delegation":
+            if planning_result is not None:
+                if (
+                    planning_result.plan is not None
+                    and planning_result.plan.execution_mode.value == "direct"
+                ):
+                    return await self._execute_single(
+                        record,
+                        task,
+                        budget,
+                        decision,
+                        is_retry,
+                        planning_evidence=planning_evidence,
+                        planning_result=planning_result,
+                    )
+                await record.mark_failed("planning_failed")
+                return self._summary(
+                    record,
+                    "failed",
+                    "planned execution mode is not supported by E2E-1B",
+                    planning_evidence=planning_evidence,
+                    planning_result=planning_result,
+                )
             return await self._execute_delegation(record, task, budget, decision)
 
         # ── Branch: SINGLE ─────────────────────────────────────────────────────
-        return await self._execute_single(record, task, budget, decision, is_retry)
+        return await self._execute_single(
+            record,
+            task,
+            budget,
+            decision,
+            is_retry,
+            planning_evidence=planning_evidence,
+            planning_result=planning_result,
+        )
 
     # ── Single-agent execution ─────────────────────────────────────────────────
 
@@ -297,13 +497,31 @@ class Orchestrator:
         budget: BudgetState,
         decision,
         is_retry: bool,
+        *,
+        planning_evidence: HMCPlanningEvidence | None = None,
+        planning_result: PlanningResult | None = None,
     ) -> dict:
+        runtime_adapter_invoked = False
+        observed_events: list[str] = []
+        agent_result = None
+
+        def summary(outcome: str, detail: str, **extra) -> dict:
+            return self._summary(
+                record,
+                outcome,
+                detail,
+                planning_evidence=planning_evidence,
+                planning_result=planning_result,
+                runtime_adapter_invoked=runtime_adapter_invoked,
+                observed_events=observed_events,
+                agent_result=agent_result,
+                **extra,
+            )
+
         # Every repository execution, including read-only work, is isolated.
         if self._wm is None:
             await record.mark_failed("workspace unavailable for repository task")
-            return self._summary(
-                record, "failed", "workspace unavailable for repository task"
-            )
+            return summary("failed", "workspace unavailable for repository task")
         write_task = self._wm.needs_worktree(task.task_type.value)
         workspace = ExecutionWorkspace.create(
             self._wm.repo_path,
@@ -329,20 +547,35 @@ class Orchestrator:
         if not submission_decision.allowed:
             workspace.rollback()
             await record.mark_abandoned(submission_decision.reason)
-            return self._summary(record, "abandoned", submission_decision.reason)
+            return summary("abandoned", submission_decision.reason)
 
         violation = budget.reserve_calls(1)
         if violation:
             workspace.rollback()
             await record.mark_abandoned(f"budget: {violation.detail}")
-            return self._summary(record, "abandoned", violation.detail)
+            return summary("abandoned", violation.detail)
         root_baseline: RepositoryBaseline | None = None
         workspace_baseline: RepositoryBaseline | None = None
         try:
             if not write_task:
                 root_baseline = self._capture_root_baseline()
                 workspace_baseline = RepositoryBaseline.capture(workspace.path)
+            if self._planning_required:
+                if self._runtime_health is None:
+                    raise RuntimeError(
+                        "runtime submission requires observed runtime health"
+                    )
+                if (
+                    planning_result is None
+                    or planning_result.plan is None
+                    or planning_result.plan.executor != "hermes"
+                    or planning_result.plan.execution_mode is None
+                ):
+                    raise RuntimeError(
+                        "runtime submission requires an executable Hermes RuntimePlan"
+                    )
             handle = await self._runtime.submit(guarded_task)
+            runtime_adapter_invoked = True
         except Exception:
             budget.release_reserved_call()
             if workspace:
@@ -363,6 +596,7 @@ class Orchestrator:
         try:
             # 7. Stream events — watch for approval / usage / errors
             async for event in self._runtime.events(handle):
+                observed_events.append(event.type)
                 await self._tel.record(
                     task.id, f"event_{event.type}", event.payload, handle.run_id
                 )
@@ -372,11 +606,7 @@ class Orchestrator:
                     terminal_confirmed = True
                     workspace.rollback()
                     await record.mark_failed("runtime approval request cannot be resumed")
-                    return self._summary(
-                        record,
-                        "failed",
-                        "runtime approval request failed closed",
-                    )
+                    return summary("failed", "runtime approval request failed closed")
 
                 elif event.type in ("completed", "error"):
                     break
@@ -394,7 +624,7 @@ class Orchestrator:
             if agent_result.status == RunStatus.FAILED:
                 workspace.rollback()
                 await record.mark_failed(agent_result.error or "agent reported failure")
-                return self._summary(record, "failed", agent_result.error or "agent error")
+                return summary("failed", agent_result.error or "agent error")
             usage = await self._runtime.usage(handle)
         except Exception as exc:
             if not terminal_confirmed:
@@ -460,8 +690,7 @@ class Orchestrator:
                         f"{cleanup_error}"
                     )
                     await record.mark_failed("read_only_mutation")
-                    return self._summary(
-                        record,
+                    return summary(
                         "failed",
                         detail,
                         eval_result=eval_result,
@@ -484,9 +713,8 @@ class Orchestrator:
                 else:
                     workspace.rollback()
                 await record.mark_failed("integration_failed")
-                return self._summary(record, "failed", str(exc), eval_result=eval_result)
-            return self._summary(
-                record,
+                return summary("failed", str(exc), eval_result=eval_result)
+            return summary(
                 "completed",
                 "",
                 eval_result=eval_result,
@@ -508,8 +736,7 @@ class Orchestrator:
             return await self._execute(record, budget=budget, is_retry=True)
 
         await record.mark_failed("eval_failed_no_retries")
-        return self._summary(
-            record,
+        return summary(
             "failed",
             "eval failed and retries exhausted",
             eval_result=eval_result,
@@ -895,6 +1122,38 @@ class Orchestrator:
         ):
             if name in extra:
                 d[name] = extra[name]
+        planning_evidence = extra.get("planning_evidence")
+        planning_result = extra.get("planning_result")
+        if planning_evidence is not None and planning_result is not None:
+            d["planned"] = _planning_payload(planning_evidence, planning_result)
+            observed_result = extra.get("agent_result")
+            observed = {
+                "runtime_adapter": "hermes",
+                "runtime_adapter_invoked": bool(
+                    extra.get("runtime_adapter_invoked", False)
+                ),
+                "run_id": (
+                    observed_result.run_id
+                    if observed_result is not None
+                    else record.run_id
+                ),
+                "runtime_status": (
+                    observed_result.status.value
+                    if observed_result is not None
+                    else None
+                ),
+                "events": list(extra.get("observed_events", [])),
+                "output": (
+                    observed_result.summary
+                    if observed_result is not None and observed_result.summary
+                    else observed_result.error
+                    if observed_result is not None
+                    else None
+                ),
+            }
+            if "usage" in extra:
+                observed["usage"] = extra["usage"].model_dump(mode="json")
+            d["observed"] = observed
         return d
 
     @staticmethod
