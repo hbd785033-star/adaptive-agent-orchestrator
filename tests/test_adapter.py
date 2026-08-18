@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from adapters.hermes.gateway import HermesAdapter, _parse_event
+from adapters.hermes.gateway import HermesAdapter, _build_ws_url, _parse_event
 from adapters.mock import MockHermesAdapter
 from adapters.runtime import AgentRuntime
 from contracts.result import RunHandle, RunStatus
@@ -15,6 +15,57 @@ from contracts.task import TaskContract, WorkspaceSpec
 
 def make_task(**kwargs) -> TaskContract:
     return TaskContract(goal="test task", **kwargs)
+
+
+def test_build_ws_url_uses_local_hermes_path_and_encodes_token() -> None:
+    url = _build_ws_url("ws://127.0.0.1:4999", "secret token/+?")
+
+    assert url.startswith("ws://127.0.0.1:4999/api/ws?")
+    assert url.count("token=") == 1
+    assert "secret%20token" in url or "secret+token" in url
+    assert "Bearer" not in url
+
+
+def test_build_ws_url_preserves_query_and_does_not_duplicate_explicit_path() -> None:
+    url = _build_ws_url("ws://127.0.0.1:4999/api/ws/?existing=1", "fresh")
+
+    assert url.startswith("ws://127.0.0.1:4999/api/ws?")
+    assert "/api/ws/api/ws" not in url
+    assert "existing=1" in url
+    assert url.count("token=") == 1
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_query_token_without_authorization_header(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class EmptyWebSocket:
+        def __aiter__(self):
+            async def messages():
+                if False:
+                    yield None
+
+            return messages()
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_connect(url, **kwargs):  # noqa: ANN001, ANN003
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return EmptyWebSocket()
+
+    monkeypatch.setattr("adapters.hermes.gateway.websockets.connect", fake_connect)
+    secret = "unlogged-secret"
+    adapter = HermesAdapter("ws://127.0.0.1:4999/api/ws?existing=1", api_key=secret)
+    await adapter.connect()
+    await adapter.disconnect()
+
+    url = str(captured["url"])
+    assert "/api/ws/api/ws" not in url
+    assert url.count("token=") == 1
+    assert secret not in repr(adapter)
+    assert captured["kwargs"] == {"additional_headers": {}}
 
 
 class FakeGatewayAdapter(HermesAdapter):
@@ -44,6 +95,164 @@ class FakeGatewayAdapter(HermesAdapter):
         if method == "session.usage":
             return {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
         return {}
+
+
+class StreamingGatewayAdapter(HermesAdapter):
+    """Deterministic harness for the installed TUI streaming contract."""
+
+    def __init__(self, events: list[dict], *, timeout: float = 1.0):
+        super().__init__(wait_timeout=timeout)
+        self.calls = []
+        self._stream_events = events
+
+    async def _call(self, method, params):
+        self.calls.append((method, params))
+        if method == "session.create":
+            return {"session_id": "session-stream"}
+        if method == "prompt.submit":
+            queue = self._event_queues["tui:session-stream"]
+            for event in self._stream_events:
+                await queue.put(event)
+            return {"status": "streaming"}
+        if method == "session.usage":
+            return {"input": 4, "output": 6, "total": 10}
+        raise AssertionError(f"unexpected RPC: {method}")
+
+
+@pytest.mark.asyncio
+async def test_streaming_ack_is_accepted_without_native_run_id() -> None:
+    adapter = StreamingGatewayAdapter([
+        {"run_id": "tui:session-stream", "type": "message", "payload": {"text": "partial"}},
+        {"run_id": "tui:session-stream", "type": "completed", "payload": {"summary": "AAO_E2E_1_OK"}},
+    ])
+
+    handle = await adapter.submit(make_task())
+    result = await adapter.wait(handle)
+
+    assert handle.run_id == "tui:session-stream"
+    assert handle.session_id == "session-stream"
+    assert result.run_id == "tui:session-stream"
+    assert result.summary == "AAO_E2E_1_OK"
+    assert not any(method == "session.subscribe" for method, _ in adapter.calls)
+
+
+@pytest.mark.asyncio
+async def test_streaming_events_require_matching_session_and_complete_canonically() -> None:
+    class EventWebSocket:
+        def __aiter__(self):
+            async def messages():
+                yield json.dumps({
+                    "method": "event",
+                    "params": {
+                        "type": "message.complete",
+                        "session_id": "other-session",
+                        "payload": {"text": "wrong"},
+                    },
+                })
+                yield json.dumps({
+                    "method": "event",
+                    "params": {
+                        "type": "message.delta",
+                        "session_id": "session-stream",
+                        "payload": {"text": "partial"},
+                    },
+                })
+                yield json.dumps({
+                    "method": "event",
+                    "params": {
+                        "type": "message.complete",
+                        "session_id": "session-stream",
+                        "payload": {"text": "canonical"},
+                    },
+                })
+
+            return messages()
+
+    adapter = HermesAdapter()
+    handle = RunHandle(run_id="tui:session-stream", task_id="task-stream", session_id="session-stream")
+    adapter._handles[handle.run_id] = handle
+    adapter._session_to_run[handle.session_id] = handle.run_id
+    adapter._event_queues[handle.run_id] = asyncio.Queue()
+    adapter._ws = EventWebSocket()
+    await adapter._recv_loop()
+
+    result = adapter._completed_results[handle.run_id]
+    assert result.status == RunStatus.COMPLETED
+    assert result.summary == "canonical"
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_and_delta_events_do_not_terminate_before_complete() -> None:
+    adapter = StreamingGatewayAdapter([
+        {"run_id": "tui:session-stream", "type": "tool_start", "payload": {"tool_name": "x"}},
+        {"run_id": "tui:session-stream", "type": "tool_complete", "payload": {"tool_name": "x", "exit_code": 0}},
+        {"run_id": "tui:session-stream", "type": "message", "payload": {"text": "delta"}},
+        {"run_id": "tui:session-stream", "type": "completed", "payload": {"summary": "done"}},
+    ])
+
+    handle = await adapter.submit(make_task())
+    result = await adapter.wait(handle)
+
+    assert result.status == RunStatus.COMPLETED
+    assert result.summary == "done"
+
+
+@pytest.mark.asyncio
+async def test_streaming_error_is_terminal_failure() -> None:
+    adapter = StreamingGatewayAdapter([
+        {"run_id": "tui:session-stream", "type": "error", "payload": {"message": "gateway failure"}},
+    ])
+
+    handle = await adapter.submit(make_task())
+    result = await adapter.wait(handle)
+
+    assert result.status == RunStatus.FAILED
+    assert result.error == "gateway failure"
+
+
+@pytest.mark.asyncio
+async def test_streaming_wait_times_out_before_terminal_event() -> None:
+    adapter = StreamingGatewayAdapter([], timeout=0.01)
+    handle = await adapter.submit(make_task())
+
+    with pytest.raises(TimeoutError, match="streaming runtime wait timed out"):
+        await adapter.wait(handle)
+
+
+@pytest.mark.asyncio
+async def test_clean_websocket_close_fails_active_stream_run() -> None:
+    class CleanCloseWebSocket:
+        def __aiter__(self):
+            async def messages():
+                if False:
+                    yield None
+
+            return messages()
+
+    adapter = HermesAdapter()
+    handle = RunHandle(
+        run_id="tui:session-clean-close",
+        task_id="task-clean-close",
+        session_id="session-clean-close",
+    )
+    adapter._handles[handle.run_id] = handle
+    adapter._session_to_run[handle.session_id] = handle.run_id
+    adapter._streaming_runs.add(handle.run_id)
+    adapter._event_queues[handle.run_id] = asyncio.Queue()
+    adapter._run_state[handle.run_id] = {
+        "files_changed": [],
+        "summary": "",
+        "error": None,
+        "usage": None,
+        "status": RunStatus.RUNNING,
+    }
+    adapter._ws = CleanCloseWebSocket()
+
+    await adapter._recv_loop()
+
+    result = adapter._completed_results[handle.run_id]
+    assert result.status == RunStatus.FAILED
+    assert "disconnected" in (result.error or "").lower()
 
 
 class TestHermesAdapterContract:

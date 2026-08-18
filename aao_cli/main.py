@@ -73,6 +73,8 @@ def _build_execution_record(
             ),
             "child_runs": result.get("child_runs"),
             "identity_observed": mock,
+            "planned": result.get("planned"),
+            "observed": result.get("observed"),
         },
     )
 
@@ -142,7 +144,6 @@ async def _run_task(**kwargs) -> None:  # noqa: ANN003
     else:
         from adapters.hermes.gateway import HermesAdapter
         runtime = HermesAdapter(url=kwargs["hermes_url"], api_key=kwargs["hermes_key"])
-        await runtime.connect()  # type: ignore[attr-defined]
 
     started_at = datetime.now(UTC)
     async with await Orchestrator.build(
