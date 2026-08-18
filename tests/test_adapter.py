@@ -285,6 +285,36 @@ class TestHermesAdapterContract:
         assert "agent/test" in prompt
 
     @pytest.mark.asyncio
+    async def test_submit_targets_authoritative_workspace_as_session_cwd(self):
+        adapter = FakeGatewayAdapter()
+        task = make_task(
+            workspace=WorkspaceSpec(
+                path="D:/worktrees/task-exact",
+                branch="agent/task-exact",
+            )
+        )
+
+        await adapter.submit(task)
+
+        assert adapter.calls[0] == (
+            "session.create",
+            {"cwd": "D:/worktrees/task-exact"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_rejects_scoped_filesystem_task_without_workspace(self):
+        adapter = FakeGatewayAdapter()
+        task = make_task(allowed_paths=["README.md"])
+
+        with pytest.raises(
+            RuntimeError,
+            match="filesystem task requires an authoritative workspace",
+        ):
+            await adapter.submit(task)
+
+        assert adapter.calls == []
+
+    @pytest.mark.asyncio
     async def test_receive_loop_buffers_event_before_submit_registers_queue(self):
         class EarlyEventWebSocket:
             def __aiter__(self):

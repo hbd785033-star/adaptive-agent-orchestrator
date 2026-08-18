@@ -348,7 +348,16 @@ class HermesAdapter:
     async def submit(self, task: TaskContract) -> RunHandle:
         # Hermes TUI creates a session, then acknowledges prompt.submit with
         # {"status": "streaming"}; the terminal answer arrives as events.
-        session = await self._call("session.create", {"label": f"task-{task.id[:8]}"})
+        if task.allowed_paths and task.workspace is None:
+            raise RuntimeError(
+                "Hermes filesystem task requires an authoritative workspace"
+            )
+        session_params = (
+            {"cwd": task.workspace.path}
+            if task.workspace is not None
+            else {"label": f"task-{task.id[:8]}"}
+        )
+        session = await self._call("session.create", session_params)
         session_id = str(session["session_id"])
         correlation_id = f"tui:{session_id}"
         submit_generation = self._connection_generation
