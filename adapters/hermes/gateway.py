@@ -343,6 +343,7 @@ class HermesAdapter:
             cancellation=True,
             session_resume=False,
             max_concurrent_runs=8,
+            filesystem_read=True,
         )
 
     async def submit(self, task: TaskContract) -> RunHandle:

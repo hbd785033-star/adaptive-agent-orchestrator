@@ -263,6 +263,11 @@ class TestHermesAdapterContract:
         caps = await adapter.capabilities()
         assert caps.streaming_events is True
         assert caps.session_resume is False
+        assert caps.filesystem_read is True
+        assert caps.filesystem_write is False
+        assert caps.shell is False
+        assert caps.tests is False
+        assert caps.web is False
         handle = await adapter.submit(make_task())
         result = await adapter.wait(handle)
         usage = await adapter.usage(handle)
