@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from model_council.inventory import discover_models as hmc_discover_models
 
 from adapters.mock import MockHermesAdapter
 from adapters.runtime import RuntimeCapabilities
+from contracts.runtime_health import HealthStatus, RuntimeHealth
 from contracts.task import RiskLevel, SubtaskSpec, TaskContract, TaskType
 from evals.gate import DeterministicEvalGate
 from orchestrator.budget import ApprovalGate, BudgetConfig
@@ -337,6 +339,53 @@ class UnobservedRuntime(MockHermesAdapter):
     async def submit(self, task):  # noqa: ANN001
         self.submit_calls += 1
         return await super().submit(task)
+
+
+@pytest.mark.asyncio
+async def test_direct_constructor_acquires_capabilities_for_planning(
+    git_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, policy = git_repo
+    runtime = ControlledRuntime()
+    await runtime.connect()
+    runtime.enqueue_scenario("pass", summary="direct-constructor")
+    db = Database(tmp_path / "direct-constructor.db")
+    await db.connect()
+    orchestrator = Orchestrator(
+        runtime=runtime,
+        db=db,
+        state_machine=StateMachine(db),
+        profiler=TaskProfiler(),
+        router=RuleRouter(policy),
+        budget_config=BudgetConfig(),
+        approval_gate=ApprovalGate(policy),
+        eval_gate=DeterministicEvalGate(repo),
+        workspace_manager=WorkspaceManager(repo, policy),
+        telemetry=TelemetryRecorder(db),
+        runtime_health=RuntimeHealth(
+            runtime="hermes",
+            status=HealthStatus.AVAILABLE,
+            reasons=["test-observed"],
+            checked_at=datetime.now(UTC),
+        ),
+        model_discoverer=lambda: [
+            ModelSpec(
+                provider="openai",
+                model="gpt-test",
+                family="openai",
+                is_current=True,
+                reasoning=True,
+                fast=True,
+                healthy=True,
+            )
+        ],
+    )
+    try:
+        result = await orchestrator.run(TaskContract(goal="direct constructor"))
+    finally:
+        await orchestrator.close()
+    assert result["outcome"] == "completed"
+    assert result["planned"]["runtime_plan"]["executor"] == "hermes"
 
 
 @pytest.mark.asyncio

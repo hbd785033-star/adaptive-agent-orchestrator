@@ -64,6 +64,21 @@ def test_claude_code_uses_native_mode_without_aao_orchestration() -> None:
     assert decision.decision_code == "selected_native"
 
 
+def test_generic_selected_runtime_uses_direct_agent_runtime_surface() -> None:
+    decision = select_execution_mode(
+        TaskProfile(parallelizable=True, persistent_execution=True),
+        selection("runtime_b"),
+        RuntimeCapabilities(native_delegation=True, native_kanban=True),
+        policy(),
+    )
+
+    assert decision.runtime == "runtime_b"
+    assert decision.mode == "direct"
+    assert decision.decision_code == "selected_direct"
+    assert decision.reasons == ["selected generic direct execution for runtime: runtime_b"]
+
+
+
 def test_hermes_simple_task_uses_direct_mode() -> None:
     decision = select_execution_mode(
         TaskProfile(reasoning_complexity="medium", execution_complexity="low"),

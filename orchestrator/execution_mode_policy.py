@@ -84,8 +84,8 @@ def select_execution_mode(
 
     return ExecutionModeDecision(
         runtime=runtime,
-        mode=None,
+        mode="direct",
         policy_version=policy.policy_version,
-        decision_code=ExecutionModeDecisionCode.UNSUPPORTED_MODE,
-        reasons=["no execution mode rule matched"],
+        decision_code=ExecutionModeDecisionCode.SELECTED_DIRECT,
+        reasons=[f"selected generic direct execution for runtime: {runtime}"],
     )

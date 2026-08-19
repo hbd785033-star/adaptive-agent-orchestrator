@@ -18,7 +18,7 @@ from pathlib import Path
 import structlog
 from model_council.inventory import ModelSpec, discover_models
 
-from adapters.runtime import AgentRuntime
+from adapters.runtime import AgentRuntime, RuntimeCapabilities
 from contracts.delegation import DelegationResult
 from contracts.evaluation import EvalStatus
 from contracts.execution_mode import ExecutionModePolicy
@@ -36,6 +36,7 @@ from orchestrator.planning_pipeline import PlanningResult, plan_runtime
 from orchestrator.profiler import TaskProfiler
 from orchestrator.prompt_guard import inject_constraints, split_for_delegation
 from orchestrator.router import RuleRouter
+from orchestrator.runtime_registry import RuntimeRegistry
 from orchestrator.state_machine import StateMachine, TaskRecord, TaskStatus
 from orchestrator.workspace import (
     ExecutionWorkspace,
@@ -95,7 +96,7 @@ class Orchestrator:
 
     def __init__(
         self,
-        runtime: AgentRuntime,
+        runtime: AgentRuntime | None,
         db: Database,
         state_machine: StateMachine,
         profiler: TaskProfiler,
@@ -106,9 +107,46 @@ class Orchestrator:
         workspace_manager: WorkspaceManager | None,
         telemetry: TelemetryRecorder,
         runtime_health: RuntimeHealth | None = None,
+        runtime_health_by_runtime: dict[str, RuntimeHealth] | None = None,
+        runtime_capabilities_by_runtime: dict[str, RuntimeCapabilities] | None = None,
         model_discoverer: Callable[[], list[ModelSpec]] | None = None,
+        runtime_registry: RuntimeRegistry | None = None,
+        runtime_selection_policy: RuntimeSelectionPolicy | None = None,
+        planning_required: bool | None = None,
     ) -> None:
-        self._runtime = runtime
+        self._runtime_registry = runtime_registry or (
+            RuntimeRegistry(entries=[("hermes", runtime)])
+            if runtime is not None
+            else None
+        )
+        if self._runtime_registry is None:
+            raise ValueError("runtime or runtime_registry is required")
+        if runtime is not None and runtime_registry is not None:
+            raise ValueError("runtime and runtime_registry are mutually exclusive")
+        identities = self._runtime_registry.identities()
+        if runtime_selection_policy is None:
+            if len(identities) != 1:
+                raise ValueError("multiple runtimes require explicit selection policy")
+            runtime_selection_policy = RuntimeSelectionPolicy(
+                policy_version="runtime-selection-v1",
+                runtime_priority=identities,
+                allow_degraded_fallback=False,
+            )
+        self._runtime_selection_policy = runtime_selection_policy
+        self._runtime_health_by_runtime: dict[str, RuntimeHealth] = {
+            identity: (runtime_health_by_runtime or {}).get(
+                identity, RuntimeHealth(runtime=identity)
+            )
+            for identity in self._runtime_registry.identities()
+        }
+        for identity, health in self._runtime_health_by_runtime.items():
+            if health.runtime != identity:
+                raise ValueError("runtime health identity must match registry identity")
+        if runtime_health is not None:
+            self._runtime_health_by_runtime["hermes"] = runtime_health
+        self._runtime_capabilities_by_runtime: dict[str, RuntimeCapabilities] = dict(
+            runtime_capabilities_by_runtime or {}
+        )
         self._db = db
         self._sm = state_machine
         self._profiler = profiler
@@ -123,12 +161,18 @@ class Orchestrator:
         self._eval_gate = eval_gate
         self._wm = workspace_manager
         self._tel = telemetry
-        self._runtime_health = runtime_health
-        self._planning_required = callable(getattr(runtime, "connect", None))
+        self._planning_required = (
+            planning_required
+            if planning_required is not None
+            else runtime is None or any(
+                callable(getattr(registered_runtime, "connect", None))
+                for _, registered_runtime in self._runtime_registry.items()
+            )
+        )
         self._model_discoverer = model_discoverer
         self._explicit_model_discoverer = model_discoverer is not None
         self._delegation_executor = DelegationExecutor(
-            runtime=runtime,
+            runtime=runtime or self._runtime_registry.resolve(self._runtime_selection_policy.runtime_priority[0]),
             eval_gate=eval_gate,
             telemetry=telemetry,
             execution_policy=self._execution_policy,
@@ -137,11 +181,14 @@ class Orchestrator:
     @classmethod
     async def build(
         cls,
-        runtime: AgentRuntime,
+        runtime: AgentRuntime | None = None,
         db_path: str = "data/orchestrator.db",
         repo_path: str = ".",
         policy_path: str = "policies/default.yaml",
         model_discoverer: Callable[[], list[ModelSpec]] | None = None,
+        runtime_registry: RuntimeRegistry | None = None,
+        runtime_selection_policy: RuntimeSelectionPolicy | None = None,
+        runtime_health_by_runtime: dict[str, RuntimeHealth] | None = None,
     ) -> Orchestrator:
         import yaml
 
@@ -177,29 +224,75 @@ class Orchestrator:
             except Exception:
                 log.warning("workspace_manager_init_failed", repo_path=repo_path)
 
-        runtime_health: RuntimeHealth | None = None
-        connect = getattr(runtime, "connect", None)
-        if callable(connect):
+        if runtime is not None and runtime_registry is not None:
+            await db.close()
+            raise ValueError("runtime and runtime_registry are mutually exclusive")
+        normalized_registry = runtime_registry or (
+            RuntimeRegistry(entries=[("hermes", runtime)])
+            if runtime is not None
+            else None
+        )
+        if normalized_registry is None:
+            await db.close()
+            raise ValueError("runtime or runtime_registry is required")
+        if runtime_selection_policy is None:
+            identities = normalized_registry.identities()
+            if len(identities) != 1:
+                await db.close()
+                raise ValueError("multiple runtimes require explicit selection policy")
+            runtime_selection_policy = RuntimeSelectionPolicy(
+                policy_version="runtime-selection-v1",
+                runtime_priority=identities,
+                allow_degraded_fallback=False,
+            )
+
+        supplied_health = dict(runtime_health_by_runtime or {})
+        for identity, health in supplied_health.items():
+            if identity not in normalized_registry.identities():
+                await db.close()
+                raise ValueError("runtime health identity is not registered")
+            if health.runtime != identity:
+                await db.close()
+                raise ValueError("runtime health identity must match registry identity")
+        observed_health_by_runtime: dict[str, RuntimeHealth] = {}
+        runtime_capabilities_by_runtime: dict[str, RuntimeCapabilities] = {}
+        for identity, registered_runtime in normalized_registry.items():
             checked_at = datetime.now(UTC)
-            try:
-                await connect()
-            except Exception as exc:
-                runtime_health = RuntimeHealth(
-                    runtime="hermes",
-                    status=HealthStatus.UNAVAILABLE,
-                    reasons=[f"Hermes Gateway connection failed: {exc}"],
-                    checked_at=checked_at,
-                )
+            connect = getattr(registered_runtime, "connect", None)
+            if callable(connect):
+                try:
+                    await connect()
+                except Exception as exc:
+                    observed_health_by_runtime[identity] = RuntimeHealth(
+                        runtime=identity,
+                        status=HealthStatus.UNAVAILABLE,
+                        reasons=[f"runtime connection failed: {exc}"],
+                        checked_at=checked_at,
+                    )
+                else:
+                    observed_health_by_runtime[identity] = RuntimeHealth(
+                        runtime=identity,
+                        status=HealthStatus.AVAILABLE,
+                        reasons=["runtime connect succeeded"],
+                        checked_at=checked_at,
+                    )
             else:
-                runtime_health = RuntimeHealth(
-                    runtime="hermes",
-                    status=HealthStatus.AVAILABLE,
-                    reasons=["Hermes Gateway connect succeeded"],
+                observed_health_by_runtime[identity] = supplied_health.get(
+                    identity, RuntimeHealth(runtime=identity)
+                )
+            try:
+                runtime_capabilities_by_runtime[identity] = await registered_runtime.capabilities()
+            except Exception as exc:
+                runtime_capabilities_by_runtime[identity] = RuntimeCapabilities()
+                observed_health_by_runtime[identity] = RuntimeHealth(
+                    runtime=identity,
+                    status=HealthStatus.UNAVAILABLE,
+                    reasons=[f"runtime capabilities failed: {exc}"],
                     checked_at=checked_at,
                 )
 
         return cls(
-            runtime=runtime,
+            runtime=None,
             db=db,
             state_machine=StateMachine(db),
             profiler=TaskProfiler(),
@@ -209,30 +302,62 @@ class Orchestrator:
             eval_gate=DeterministicEvalGate(repo_path),
             workspace_manager=workspace_manager,
             telemetry=TelemetryRecorder(db),
-            runtime_health=runtime_health,
+            runtime_health_by_runtime=observed_health_by_runtime,
+            runtime_capabilities_by_runtime=runtime_capabilities_by_runtime,
             model_discoverer=model_discoverer,
+            runtime_registry=normalized_registry,
+            runtime_selection_policy=runtime_selection_policy,
+            planning_required=(
+                runtime is None
+                or runtime_registry is not None
+                or model_discoverer is not None
+                or any(
+                    callable(getattr(registered_runtime, "model_inventory_payload", None))
+                    for _, registered_runtime in normalized_registry.items()
+                )
+            ),
         )
 
     async def close(self) -> None:
-        disconnect = getattr(self._runtime, "disconnect", None)
         try:
-            if callable(disconnect):
-                with contextlib.suppress(Exception):
-                    await disconnect()
+            for _identity, runtime in self._runtime_registry.items():
+                disconnect = getattr(runtime, "disconnect", None)
+                if callable(disconnect):
+                    with contextlib.suppress(Exception):
+                        await disconnect()
         finally:
             await self._db.close()
 
+    def _planning_health_available(self) -> bool:
+        return any(
+            health.status == HealthStatus.AVAILABLE
+            for health in self._runtime_health_by_runtime.values()
+        )
+
+    def _planning_health_observed(self) -> bool:
+        return all(
+            health.status != HealthStatus.UNKNOWN
+            for health in self._runtime_health_by_runtime.values()
+        )
+
     async def _resolve_planning_models(self) -> list[ModelSpec]:
-        if self._explicit_model_discoverer:
-            assert self._model_discoverer is not None
-            models = self._model_discoverer()
-        else:
-            inventory = getattr(self._runtime, "model_inventory_payload", None)
-            if callable(inventory):
+        if not self._explicit_model_discoverer:
+            inventory = next(
+                (
+                    registered_runtime.model_inventory_payload
+                    for _, registered_runtime in self._runtime_registry.items()
+                    if callable(getattr(registered_runtime, "model_inventory_payload", None))
+                ),
+                None,
+            )
+            if inventory is not None:
                 payload = await inventory()
                 models = discover_models(payload=payload)
             else:
                 models = discover_models()
+        else:
+            assert self._model_discoverer is not None
+            models = self._model_discoverer()
         if not models:
             raise RuntimeError("HMC model inventory contains no usable configured models")
         return models
@@ -242,15 +367,9 @@ class Orchestrator:
         task: TaskContract,
     ) -> tuple[HMCPlanningEvidence, PlanningResult] | None:
         """Prepare HMC evidence and an AAO plan before runtime submission."""
-        if self._runtime_health is None:
+        if not self._planning_health_observed():
             raise RuntimeError(
-                "runtime health is unavailable; executable planning is required "
-                "before Hermes submission"
-            )
-        if self._runtime_health.status != HealthStatus.AVAILABLE:
-            raise RuntimeError(
-                "Hermes runtime health is not available: "
-                + "; ".join(self._runtime_health.reasons)
+                "runtime health is unavailable; executable planning is required before runtime submission"
             )
 
         models = await self._resolve_planning_models()
@@ -258,21 +377,33 @@ class Orchestrator:
             task,
             model_discoverer=lambda: models,
         )
-        capabilities = await self._runtime.capabilities()
-        candidate = RuntimeCandidate(
-            runtime="hermes",
-            capabilities=capabilities,
-            health=self._runtime_health,
-        )
+        candidates = []
+        for identity, registered_runtime in self._runtime_registry.items():
+            capabilities = self._runtime_capabilities_by_runtime.get(identity)
+            if capabilities is None:
+                try:
+                    capabilities = await registered_runtime.capabilities()
+                except Exception as exc:
+                    self._runtime_health_by_runtime[identity] = RuntimeHealth(
+                        runtime=identity,
+                        status=HealthStatus.UNAVAILABLE,
+                        reasons=[f"runtime capabilities failed: {exc}"],
+                        checked_at=datetime.now(UTC),
+                    )
+                    capabilities = RuntimeCapabilities()
+                self._runtime_capabilities_by_runtime[identity] = capabilities
+            candidates.append(
+                RuntimeCandidate(
+                    runtime=identity,
+                    capabilities=capabilities,
+                    health=self._runtime_health_by_runtime[identity],
+                )
+            )
         planning_result = plan_runtime(
             evidence.intake.profile,
             evidence.intake.requirements,
-            [candidate],
-            RuntimeSelectionPolicy(
-                policy_version="runtime-selection-v1",
-                runtime_priority=("hermes",),
-                allow_degraded_fallback=False,
-            ),
+            candidates,
+            self._runtime_selection_policy,
             ExecutionModePolicy(policy_version="execution-mode-v1"),
             plan_policy_version="runtime-plan-v1",
             hmc_context=evidence.context,
@@ -300,15 +431,15 @@ class Orchestrator:
             protected_paths=(self._wm._base.resolve(),),
         )
 
-    async def _cancel_and_confirm_terminal(self, handle) -> None:
+    async def _cancel_and_confirm_terminal(self, runtime: AgentRuntime, handle) -> None:
         """Cancel a submitted run and prove terminal state before artifact removal."""
         cancel_error: Exception | None = None
         try:
-            await self._runtime.cancel(handle)
+            await runtime.cancel(handle)
         except Exception as exc:
             cancel_error = exc
         try:
-            result = await self._runtime.wait(handle)
+            result = await runtime.wait(handle)
         except Exception as exc:
             detail = f"terminal confirmation failed: {exc}"
             if cancel_error is not None:
@@ -396,13 +527,6 @@ class Orchestrator:
         planning_evidence: HMCPlanningEvidence | None = None
         planning_result: PlanningResult | None = None
         if self._planning_required and not task.subtasks:
-            if self._runtime_health is None:
-                await record.mark_failed("planning_failed")
-                return self._summary(
-                    record,
-                    "failed",
-                    "runtime health is unavailable; executable planning is required before Hermes submission",
-                )
             try:
                 prepared = await self._prepare_hmc_planning(task)
                 if prepared is not None:
@@ -420,15 +544,6 @@ class Orchestrator:
                     record,
                     "failed",
                     "HMC/AAO planning produced no executable RuntimePlan",
-                    planning_evidence=planning_evidence,
-                    planning_result=planning_result,
-                )
-            if planning_result.plan.executor != "hermes":
-                await record.mark_failed("planning_failed")
-                return self._summary(
-                    record,
-                    "failed",
-                    "HMC/AAO planning selected a non-Hermes executor",
                     planning_evidence=planning_evidence,
                     planning_result=planning_result,
                 )
@@ -521,6 +636,14 @@ class Orchestrator:
         runtime_adapter_invoked = False
         observed_events: list[str] = []
         agent_result = None
+        planned_runtime = planning_result.plan.executor if planning_result and planning_result.plan else None
+        if (
+            planning_result is not None
+            and planning_result.selection.selected_runtime != planned_runtime
+        ):
+            raise RuntimeError("RuntimePlan executor must match runtime selection")
+        runtime_identity = planned_runtime or self._runtime_selection_policy.runtime_priority[0]
+        runtime = self._runtime_registry.resolve(runtime_identity)
 
         def summary(outcome: str, detail: str, **extra) -> dict:
             return self._summary(
@@ -532,6 +655,7 @@ class Orchestrator:
                 runtime_adapter_invoked=runtime_adapter_invoked,
                 observed_events=observed_events,
                 agent_result=agent_result,
+                observed_runtime=(runtime_identity if runtime_adapter_invoked else None),
                 **extra,
             )
 
@@ -578,20 +702,20 @@ class Orchestrator:
                 root_baseline = self._capture_root_baseline()
                 workspace_baseline = RepositoryBaseline.capture(workspace.path)
             if self._planning_required:
-                if self._runtime_health is None:
+                if runtime is None or planned_runtime is None:
                     raise RuntimeError(
-                        "runtime submission requires observed runtime health"
+                        "runtime submission requires an executable RuntimePlan"
                     )
-                if (
-                    planning_result is None
-                    or planning_result.plan is None
-                    or planning_result.plan.executor != "hermes"
-                    or planning_result.plan.execution_mode is None
-                ):
+                if self._runtime_health_by_runtime[planned_runtime].status != HealthStatus.AVAILABLE:
                     raise RuntimeError(
-                        "runtime submission requires an executable Hermes RuntimePlan"
+                        "runtime submission requires available observed runtime health"
                     )
-            handle = await self._runtime.submit(guarded_task)
+                if planning_result is None or planning_result.plan is None or planning_result.plan.execution_mode is None:
+                    raise RuntimeError(
+                        "runtime submission requires an executable RuntimePlan"
+                    )
+            assert runtime is not None
+            handle = await runtime.submit(guarded_task)
             runtime_adapter_invoked = True
         except Exception:
             budget.release_reserved_call()
@@ -605,21 +729,21 @@ class Orchestrator:
                 task.id, "task_submitted", {"run_id": handle.run_id}, handle.run_id
             )
         except Exception:
-            await self._cancel_and_confirm_terminal(handle)
+            await self._cancel_and_confirm_terminal(runtime, handle)
             workspace.rollback()
             raise
 
         terminal_confirmed = False
         try:
             # 7. Stream events — watch for approval / usage / errors
-            async for event in self._runtime.events(handle):
+            async for event in runtime.events(handle):
                 observed_events.append(event.type)
                 await self._tel.record(
                     task.id, f"event_{event.type}", event.payload, handle.run_id
                 )
 
                 if event.type == "approval_request":
-                    await self._cancel_and_confirm_terminal(handle)
+                    await self._cancel_and_confirm_terminal(runtime, handle)
                     terminal_confirmed = True
                     workspace.rollback()
                     await record.mark_failed("runtime approval request cannot be resumed")
@@ -628,7 +752,7 @@ class Orchestrator:
                 elif event.type in ("completed", "error"):
                     break
 
-            agent_result = await self._runtime.wait(handle)
+            agent_result = await runtime.wait(handle)
             terminal_confirmed = agent_result.status in {
                 RunStatus.COMPLETED,
                 RunStatus.FAILED,
@@ -642,11 +766,11 @@ class Orchestrator:
                 workspace.rollback()
                 await record.mark_failed(agent_result.error or "agent reported failure")
                 return summary("failed", agent_result.error or "agent error")
-            usage = await self._runtime.usage(handle)
+            usage = await runtime.usage(handle)
         except Exception as exc:
             if not terminal_confirmed:
                 try:
-                    await self._cancel_and_confirm_terminal(handle)
+                    await self._cancel_and_confirm_terminal(runtime, handle)
                     terminal_confirmed = True
                 except Exception as quiescence_error:
                     raise RuntimeError(str(quiescence_error)) from exc
@@ -1145,7 +1269,7 @@ class Orchestrator:
             d["planned"] = _planning_payload(planning_evidence, planning_result)
             observed_result = extra.get("agent_result")
             observed = {
-                "runtime_adapter": "hermes",
+                "runtime_adapter": extra.get("observed_runtime"),
                 "runtime_adapter_invoked": bool(
                     extra.get("runtime_adapter_invoked", False)
                 ),
