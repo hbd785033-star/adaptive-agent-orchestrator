@@ -335,6 +335,15 @@ class HermesAdapter:
 
     # ── AgentRuntime protocol ─────────────────────────────────────────────────
 
+    async def model_inventory_payload(self) -> dict:
+        """Return the authenticated Hermes picker payload without normalizing it."""
+        payload = await self._call("model.options", {"refresh": False})
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("providers"), list
+        ):
+            raise RuntimeError("Hermes Gateway returned an invalid model inventory response")
+        return payload
+
     async def capabilities(self) -> RuntimeCapabilities:
         return RuntimeCapabilities(
             streaming_events=True,

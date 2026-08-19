@@ -125,7 +125,8 @@ class Orchestrator:
         self._tel = telemetry
         self._runtime_health = runtime_health
         self._planning_required = callable(getattr(runtime, "connect", None))
-        self._model_discoverer = model_discoverer or discover_models
+        self._model_discoverer = model_discoverer
+        self._explicit_model_discoverer = model_discoverer is not None
         self._delegation_executor = DelegationExecutor(
             runtime=runtime,
             eval_gate=eval_gate,
@@ -221,6 +222,21 @@ class Orchestrator:
         finally:
             await self._db.close()
 
+    async def _resolve_planning_models(self) -> list[ModelSpec]:
+        if self._explicit_model_discoverer:
+            assert self._model_discoverer is not None
+            models = self._model_discoverer()
+        else:
+            inventory = getattr(self._runtime, "model_inventory_payload", None)
+            if callable(inventory):
+                payload = await inventory()
+                models = discover_models(payload=payload)
+            else:
+                models = discover_models()
+        if not models:
+            raise RuntimeError("HMC model inventory contains no usable configured models")
+        return models
+
     async def _prepare_hmc_planning(
         self,
         task: TaskContract,
@@ -237,9 +253,10 @@ class Orchestrator:
                 + "; ".join(self._runtime_health.reasons)
             )
 
+        models = await self._resolve_planning_models()
         evidence = build_hmc_planning(
             task,
-            model_discoverer=self._model_discoverer,
+            model_discoverer=lambda: models,
         )
         capabilities = await self._runtime.capabilities()
         candidate = RuntimeCandidate(

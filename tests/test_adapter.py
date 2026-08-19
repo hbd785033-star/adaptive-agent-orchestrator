@@ -97,6 +97,69 @@ class FakeGatewayAdapter(HermesAdapter):
         return {}
 
 
+class InventoryGatewayAdapter(HermesAdapter):
+    """No-network harness for authenticated model inventory retrieval."""
+
+    def __init__(self, response=None, error: Exception | None = None):
+        super().__init__()
+        self.calls = []
+        self.response = response
+        self.error = error
+
+    async def _call(self, method, params):
+        self.calls.append((method, params))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_model_inventory_payload_uses_picker_rpc_without_task_submission() -> None:
+    payload = {
+        "provider": "openai",
+        "model": "gpt-test",
+        "providers": [{"slug": "openai", "models": ["gpt-test"]}],
+    }
+    adapter = InventoryGatewayAdapter(payload)
+
+    result = await adapter.model_inventory_payload()
+
+    assert result is payload
+    assert adapter.calls == [("model.options", {"refresh": False})]
+    assert not any(
+        method in {"session.create", "prompt.submit"}
+        for method, _ in adapter.calls
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [None, [], "invalid", {}, {"providers": None}, {"providers": {}}],
+)
+async def test_model_inventory_payload_rejects_malformed_responses(payload) -> None:
+    adapter = InventoryGatewayAdapter(payload)
+
+    with pytest.raises(RuntimeError, match="invalid model inventory response"):
+        await adapter.model_inventory_payload()
+
+    assert adapter.calls == [("model.options", {"refresh": False})]
+
+
+@pytest.mark.asyncio
+async def test_model_inventory_payload_propagates_rpc_failure_without_submission() -> None:
+    adapter = InventoryGatewayAdapter(error=RuntimeError("inventory unavailable"))
+
+    with pytest.raises(RuntimeError, match="inventory unavailable"):
+        await adapter.model_inventory_payload()
+
+    assert adapter.calls == [("model.options", {"refresh": False})]
+    assert not any(
+        method in {"session.create", "prompt.submit"}
+        for method, _ in adapter.calls
+    )
+
+
 class StreamingGatewayAdapter(HermesAdapter):
     """Deterministic harness for the installed TUI streaming contract."""
 

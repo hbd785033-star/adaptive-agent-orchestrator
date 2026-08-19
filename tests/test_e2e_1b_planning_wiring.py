@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 from model_council.inventory import ModelSpec
+from model_council.inventory import discover_models as hmc_discover_models
 
 from adapters.mock import MockHermesAdapter
+from adapters.runtime import RuntimeCapabilities
 from contracts.task import RiskLevel, SubtaskSpec, TaskContract, TaskType
 from evals.gate import DeterministicEvalGate
 from orchestrator.budget import ApprovalGate, BudgetConfig
@@ -78,6 +80,175 @@ worktree:
         encoding="utf-8",
     )
     return repo, policy
+
+
+class InventoryRuntime(ControlledRuntime):
+    """Deterministic runtime exposing the Hermes picker inventory seam."""
+
+    def __init__(self, payload) -> None:  # noqa: ANN001
+        super().__init__()
+        self.payload = payload
+        self.inventory_calls = 0
+
+    async def model_inventory_payload(self):  # noqa: ANN001
+        self.inventory_calls += 1
+        return self.payload
+
+    async def capabilities(self) -> RuntimeCapabilities:
+        return RuntimeCapabilities(
+            streaming_events=True,
+            mid_run_steer=False,
+            native_delegation=False,
+            cancellation=True,
+            session_resume=False,
+            max_concurrent_runs=8,
+            filesystem_read=True,
+        )
+
+
+class NoDirectDiscoveryRuntime(InventoryRuntime):
+    """Payload runtime whose test fails if default HMC discovery is invoked."""
+
+
+@pytest.fixture
+def filesystem_read_task() -> TaskContract:
+    return TaskContract(
+        task_type=TaskType.CODE_REVIEW,
+        goal=(
+            "Read README.md from the permitted workspace and return exactly the "
+            "first non-empty line after the Markdown H1 heading, verbatim."
+        ),
+        allowed_paths=["README.md"],
+        output_schema=[],
+        risk=RiskLevel.LOW,
+        complexity=1,
+        subtasks=[],
+    )
+
+
+def picker_payload() -> dict:
+    return {
+        "provider": "openai",
+        "model": "gpt-test",
+        "providers": [
+            {
+                "slug": "openai",
+                "authenticated": True,
+                "models": ["gpt-test"],
+                "capabilities": {"gpt-test": {"reasoning": True, "fast": True}},
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_picker_payload_drives_real_hmc_planning_without_hermes_import(
+    git_repo: tuple[Path, Path], tmp_path: Path, filesystem_read_task: TaskContract, monkeypatch
+) -> None:
+    repo, policy = git_repo
+    runtime = InventoryRuntime(picker_payload())
+    runtime.enqueue_scenario("pass", summary="planned")
+
+    def forbidden_default_discovery(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("default Hermes-module discovery must not be invoked")
+
+    monkeypatch.setattr(
+        "model_council.inventory._hermes_payload", forbidden_default_discovery
+    )
+    async with await Orchestrator.build(
+        runtime=runtime,
+        db_path=str(tmp_path / "inventory.db"),
+        repo_path=str(repo),
+        policy_path=str(policy),
+    ) as orchestrator:
+        result = await orchestrator.run(filesystem_read_task)
+
+    assert runtime.inventory_calls == 1
+    assert result["outcome"] == "completed"
+    assert result["planned"]["hmc"]["request_type"] == "PlannerRequest"
+    assert result["planned"]["hmc"]["recommendation_type"] == "PlannerRecommendation"
+    assert result["planned"]["runtime_plan"]["executor"] == "hermes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, {"providers": []}, {"providers": None}])
+async def test_inventory_failure_is_before_submission(
+    git_repo: tuple[Path, Path], tmp_path: Path, filesystem_read_task: TaskContract, payload
+) -> None:
+    repo, policy = git_repo
+    runtime = InventoryRuntime(payload)
+    runtime.enqueue_scenario("pass", summary="must not execute")
+    async with await Orchestrator.build(
+        runtime=runtime,
+        db_path=str(tmp_path / "inventory-fail.db"),
+        repo_path=str(repo),
+        policy_path=str(policy),
+    ) as orchestrator:
+        result = await orchestrator.run(filesystem_read_task)
+
+    assert runtime.inventory_calls == 1
+    assert runtime.submit_calls == 0
+    assert result["outcome"] == "failed"
+    assert result["run_id"] is None
+    assert "planning" in result["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_explicit_model_discoverer_precedes_runtime_inventory(
+    git_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, policy = git_repo
+    runtime = InventoryRuntime({"providers": []})
+    runtime.enqueue_scenario("pass", summary="injected")
+    inventory = [
+        ModelSpec(
+            provider="openai",
+            model="gpt-test",
+            family="openai",
+            is_current=True,
+            reasoning=True,
+            fast=True,
+            healthy=True,
+        )
+    ]
+    task = TaskContract(goal="injected planning", complexity=1, risk=RiskLevel.LOW)
+    async with await Orchestrator.build(
+        runtime=runtime,
+        db_path=str(tmp_path / "injected.db"),
+        repo_path=str(repo),
+        policy_path=str(policy),
+        model_discoverer=lambda: inventory,
+    ) as orchestrator:
+        result = await orchestrator.run(task)
+
+    assert runtime.inventory_calls == 0
+    assert result["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_payload_normalization_uses_hmc_discover_models_payload_keyword(
+    git_repo: tuple[Path, Path], tmp_path: Path, filesystem_read_task: TaskContract, monkeypatch
+) -> None:
+    repo, policy = git_repo
+    runtime = InventoryRuntime(picker_payload())
+    runtime.enqueue_scenario("pass", summary="normalized")
+    seen = []
+
+    def capture(payload=None):  # noqa: ANN001
+        seen.append(payload)
+        return hmc_discover_models(payload=payload)
+
+    monkeypatch.setattr("orchestrator.engine.discover_models", capture)
+    async with await Orchestrator.build(
+        runtime=runtime,
+        db_path=str(tmp_path / "payload.db"),
+        repo_path=str(repo),
+        policy_path=str(policy),
+    ) as orchestrator:
+        result = await orchestrator.run(filesystem_read_task)
+
+    assert result["outcome"] == "completed"
+    assert seen == [picker_payload()]
 
 
 @pytest.mark.asyncio
