@@ -26,8 +26,6 @@ class NoLifecycleRuntime(MockHermesAdapter):
     async def submit(self, task):  # noqa: ANN001
         self.submit_calls += 1
         return await super().submit(task)
-
-
 class TrackingRuntime(MockHermesAdapter):
     def __init__(
         self,
@@ -85,6 +83,17 @@ class TrackingRuntime(MockHermesAdapter):
     async def cancel(self, handle):  # noqa: ANN001
         self.cancel_calls += 1
         await super().cancel(handle)
+
+
+class InventoryOnlyRuntime(TrackingRuntime):
+    def __init__(self, payload: dict) -> None:
+        super().__init__()
+        self.payload = payload
+        self.inventory_calls = 0
+
+    async def model_inventory_payload(self) -> dict:
+        self.inventory_calls += 1
+        return self.payload
 
 
 @pytest.fixture
@@ -185,6 +194,50 @@ async def build_multi(
 
 
 @pytest.mark.asyncio
+async def test_non_hermes_inventory_provider_supports_planning(
+    git_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, policy_path = git_repo
+    payload = {
+        "provider": "openai",
+        "model": "gpt-test",
+        "providers": [{"slug": "openai", "authenticated": True, "models": ["gpt-test"], "capabilities": {"gpt-test": {"reasoning": True, "fast": True}}}],
+    }
+    runtime = InventoryOnlyRuntime(payload)
+    runtime.enqueue_scenario("pass")
+    orchestrator = await Orchestrator.build(
+        runtime_registry=RuntimeRegistry(entries=[("runtime_b", runtime)]),
+        runtime_selection_policy=policy("runtime_b"),
+        db_path=str(tmp_path / "inventory-provider.db"),
+        repo_path=str(repo),
+        policy_path=str(policy_path),
+    )
+    result = await orchestrator.run(task())
+    await orchestrator.close()
+    assert result["outcome"] == "completed"
+    assert runtime.inventory_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_capability_failure_does_not_block_healthy_runtime(
+    git_repo: tuple[Path, Path], tmp_path: Path, inventory: list[ModelSpec]
+) -> None:
+    class BrokenCapabilities(TrackingRuntime):
+        async def capabilities(self) -> RuntimeCapabilities:
+            raise RuntimeError("capability probe failed")
+
+    broken = BrokenCapabilities()
+    healthy = TrackingRuntime()
+    healthy.enqueue_scenario("pass")
+    orchestrator = await build_multi(git_repo, tmp_path, inventory, broken, healthy, selection_policy=policy("runtime_b", "hermes"))
+    result = await orchestrator.run(task())
+    await orchestrator.close()
+    assert result["outcome"] == "completed"
+    assert broken.submit_calls == 0
+    assert healthy.submit_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_protocol_only_registry_runtime_cannot_bypass_planning(
     git_repo: tuple[Path, Path], tmp_path: Path, inventory: list[ModelSpec]
 ) -> None:
@@ -226,6 +279,28 @@ async def test_health_identity_mismatch_fails_closed(
             repo_path=str(repo),
             policy_path=str(policy_path),
         )
+
+
+@pytest.mark.asyncio
+async def test_pre_submit_failure_does_not_fabricate_observed_runtime(
+    git_repo: tuple[Path, Path], tmp_path: Path, inventory: list[ModelSpec]
+) -> None:
+    hermes = TrackingRuntime()
+    runtime_b = TrackingRuntime()
+    orchestrator = await build_multi(
+        git_repo,
+        tmp_path,
+        inventory,
+        hermes,
+        runtime_b,
+        selection_policy=policy("runtime_b", "hermes"),
+    )
+    orchestrator._wm = None
+    result = await orchestrator.run(task())
+    await orchestrator.close()
+    assert result["outcome"] == "failed"
+    assert result["observed"]["runtime_adapter_invoked"] is False
+    assert result["observed"]["runtime_adapter"] is None
 
 
 @pytest.mark.asyncio

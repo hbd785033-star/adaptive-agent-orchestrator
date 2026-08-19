@@ -283,6 +283,7 @@ class Orchestrator:
             try:
                 runtime_capabilities_by_runtime[identity] = await registered_runtime.capabilities()
             except Exception as exc:
+                runtime_capabilities_by_runtime[identity] = RuntimeCapabilities()
                 observed_health_by_runtime[identity] = RuntimeHealth(
                     runtime=identity,
                     status=HealthStatus.UNAVAILABLE,
@@ -341,8 +342,15 @@ class Orchestrator:
 
     async def _resolve_planning_models(self) -> list[ModelSpec]:
         if not self._explicit_model_discoverer:
-            inventory = getattr(self._runtime_registry.resolve("hermes"), "model_inventory_payload", None)
-            if callable(inventory):
+            inventory = next(
+                (
+                    registered_runtime.model_inventory_payload
+                    for _, registered_runtime in self._runtime_registry.items()
+                    if callable(getattr(registered_runtime, "model_inventory_payload", None))
+                ),
+                None,
+            )
+            if inventory is not None:
                 payload = await inventory()
                 models = discover_models(payload=payload)
             else:
@@ -369,14 +377,28 @@ class Orchestrator:
             task,
             model_discoverer=lambda: models,
         )
-        candidates = [
-            RuntimeCandidate(
-                runtime=identity,
-                capabilities=self._runtime_capabilities_by_runtime[identity],
-                health=self._runtime_health_by_runtime[identity],
+        candidates = []
+        for identity, registered_runtime in self._runtime_registry.items():
+            capabilities = self._runtime_capabilities_by_runtime.get(identity)
+            if capabilities is None:
+                try:
+                    capabilities = await registered_runtime.capabilities()
+                except Exception as exc:
+                    self._runtime_health_by_runtime[identity] = RuntimeHealth(
+                        runtime=identity,
+                        status=HealthStatus.UNAVAILABLE,
+                        reasons=[f"runtime capabilities failed: {exc}"],
+                        checked_at=datetime.now(UTC),
+                    )
+                    capabilities = RuntimeCapabilities()
+                self._runtime_capabilities_by_runtime[identity] = capabilities
+            candidates.append(
+                RuntimeCandidate(
+                    runtime=identity,
+                    capabilities=capabilities,
+                    health=self._runtime_health_by_runtime[identity],
+                )
             )
-            for identity, _ in self._runtime_registry.items()
-        ]
         planning_result = plan_runtime(
             evidence.intake.profile,
             evidence.intake.requirements,
@@ -633,7 +655,7 @@ class Orchestrator:
                 runtime_adapter_invoked=runtime_adapter_invoked,
                 observed_events=observed_events,
                 agent_result=agent_result,
-                observed_runtime=runtime_identity,
+                observed_runtime=(runtime_identity if runtime_adapter_invoked else None),
                 **extra,
             )
 
