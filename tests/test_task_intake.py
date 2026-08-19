@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contracts.task import SubtaskSpec, TaskContract, TaskType
+from contracts.task import RiskLevel, SubtaskSpec, TaskContract, TaskType
 from orchestrator.task_intake import (
     derive_task_profile,
     derive_task_requirements,
@@ -84,6 +84,35 @@ def test_code_fix_requires_vendor_neutral_code_capabilities() -> None:
     assert requirements.shell is True
     assert requirements.tests is True
     assert requirements.web is False
+
+
+def test_readme_code_review_requires_only_filesystem_read() -> None:
+    task = TaskContract(
+        task_type=TaskType.CODE_REVIEW,
+        goal=(
+            "Read README.md from the permitted workspace and return exactly the first "
+            "non-empty line after the Markdown H1 heading, verbatim, with no quotation "
+            "marks or explanation."
+        ),
+        allowed_paths=["README.md"],
+        output_schema=[],
+        risk=RiskLevel.LOW,
+        complexity=1,
+        subtasks=[],
+    )
+
+    requirements = derive_task_requirements(task)
+
+    assert requirements.model_dump() == {
+        "filesystem_read": True,
+        "filesystem_write": False,
+        "shell": False,
+        "tests": False,
+        "web": False,
+        "background_execution": False,
+        "persistent_tasks": False,
+        "human_in_loop": False,
+    }
 
 
 def test_parallel_research_requires_web_without_write() -> None:

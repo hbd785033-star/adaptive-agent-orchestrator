@@ -97,6 +97,69 @@ class FakeGatewayAdapter(HermesAdapter):
         return {}
 
 
+class InventoryGatewayAdapter(HermesAdapter):
+    """No-network harness for authenticated model inventory retrieval."""
+
+    def __init__(self, response=None, error: Exception | None = None):
+        super().__init__()
+        self.calls = []
+        self.response = response
+        self.error = error
+
+    async def _call(self, method, params):
+        self.calls.append((method, params))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_model_inventory_payload_uses_picker_rpc_without_task_submission() -> None:
+    payload = {
+        "provider": "openai",
+        "model": "gpt-test",
+        "providers": [{"slug": "openai", "models": ["gpt-test"]}],
+    }
+    adapter = InventoryGatewayAdapter(payload)
+
+    result = await adapter.model_inventory_payload()
+
+    assert result is payload
+    assert adapter.calls == [("model.options", {"refresh": False})]
+    assert not any(
+        method in {"session.create", "prompt.submit"}
+        for method, _ in adapter.calls
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [None, [], "invalid", {}, {"providers": None}, {"providers": {}}],
+)
+async def test_model_inventory_payload_rejects_malformed_responses(payload) -> None:
+    adapter = InventoryGatewayAdapter(payload)
+
+    with pytest.raises(RuntimeError, match="invalid model inventory response"):
+        await adapter.model_inventory_payload()
+
+    assert adapter.calls == [("model.options", {"refresh": False})]
+
+
+@pytest.mark.asyncio
+async def test_model_inventory_payload_propagates_rpc_failure_without_submission() -> None:
+    adapter = InventoryGatewayAdapter(error=RuntimeError("inventory unavailable"))
+
+    with pytest.raises(RuntimeError, match="inventory unavailable"):
+        await adapter.model_inventory_payload()
+
+    assert adapter.calls == [("model.options", {"refresh": False})]
+    assert not any(
+        method in {"session.create", "prompt.submit"}
+        for method, _ in adapter.calls
+    )
+
+
 class StreamingGatewayAdapter(HermesAdapter):
     """Deterministic harness for the installed TUI streaming contract."""
 
@@ -263,6 +326,11 @@ class TestHermesAdapterContract:
         caps = await adapter.capabilities()
         assert caps.streaming_events is True
         assert caps.session_resume is False
+        assert caps.filesystem_read is True
+        assert caps.filesystem_write is False
+        assert caps.shell is False
+        assert caps.tests is False
+        assert caps.web is False
         handle = await adapter.submit(make_task())
         result = await adapter.wait(handle)
         usage = await adapter.usage(handle)
@@ -283,6 +351,36 @@ class TestHermesAdapterContract:
         prompt = task.prompt_preamble()
         assert "D:/worktree" in prompt
         assert "agent/test" in prompt
+
+    @pytest.mark.asyncio
+    async def test_submit_targets_authoritative_workspace_as_session_cwd(self):
+        adapter = FakeGatewayAdapter()
+        task = make_task(
+            workspace=WorkspaceSpec(
+                path="D:/worktrees/task-exact",
+                branch="agent/task-exact",
+            )
+        )
+
+        await adapter.submit(task)
+
+        assert adapter.calls[0] == (
+            "session.create",
+            {"cwd": "D:/worktrees/task-exact"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_rejects_scoped_filesystem_task_without_workspace(self):
+        adapter = FakeGatewayAdapter()
+        task = make_task(allowed_paths=["README.md"])
+
+        with pytest.raises(
+            RuntimeError,
+            match="filesystem task requires an authoritative workspace",
+        ):
+            await adapter.submit(task)
+
+        assert adapter.calls == []
 
     @pytest.mark.asyncio
     async def test_receive_loop_buffers_event_before_submit_registers_queue(self):

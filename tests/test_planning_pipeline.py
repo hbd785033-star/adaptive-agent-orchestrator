@@ -288,3 +288,49 @@ def test_hmc_context_is_preserved_when_execution_mode_is_unsupported() -> None:
     assert result.mode is not None
     assert result.mode.mode is None
     assert result.plan is None
+
+
+def test_filesystem_read_capability_fail_closed_then_builds_hermes_runtime_plan() -> None:
+    context = hmc_context()
+    requirements = TaskRequirements(filesystem_read=True)
+    selection_policy = RuntimeSelectionPolicy(
+        policy_version="selection-test-v1",
+        runtime_priority=("hermes",),
+    )
+    mode_policy = ExecutionModePolicy(policy_version="mode-test-v1")
+
+    without_read = plan_runtime(
+        TaskProfile(),
+        requirements,
+        [candidate("hermes", filesystem_read=False)],
+        selection_policy,
+        mode_policy,
+        plan_policy_version="plan-test-v1",
+        hmc_context=context,
+    )
+
+    assert without_read.assessments[0].eligible is False
+    assert without_read.assessments[0].missing_capabilities == ["filesystem_read"]
+    assert without_read.selection.selected_runtime is None
+    assert without_read.mode is None
+    assert without_read.plan is None
+    assert without_read.hmc_context is context
+
+    with_read = plan_runtime(
+        TaskProfile(),
+        requirements,
+        [candidate("hermes", filesystem_read=True)],
+        selection_policy,
+        mode_policy,
+        plan_policy_version="plan-test-v1",
+        hmc_context=context,
+    )
+
+    assert with_read.assessments[0].eligible is True
+    assert with_read.assessments[0].missing_capabilities == []
+    assert with_read.selection.selected_runtime == "hermes"
+    assert with_read.mode is not None
+    assert with_read.mode.mode.value == "direct"
+    assert with_read.plan is not None
+    assert with_read.plan.executor == "hermes"
+    assert with_read.plan.planner == "model_council"

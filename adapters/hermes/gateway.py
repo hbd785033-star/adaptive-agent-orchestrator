@@ -335,6 +335,15 @@ class HermesAdapter:
 
     # ── AgentRuntime protocol ─────────────────────────────────────────────────
 
+    async def model_inventory_payload(self) -> dict:
+        """Return the authenticated Hermes picker payload without normalizing it."""
+        payload = await self._call("model.options", {"refresh": False})
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("providers"), list
+        ):
+            raise RuntimeError("Hermes Gateway returned an invalid model inventory response")
+        return payload
+
     async def capabilities(self) -> RuntimeCapabilities:
         return RuntimeCapabilities(
             streaming_events=True,
@@ -343,12 +352,22 @@ class HermesAdapter:
             cancellation=True,
             session_resume=False,
             max_concurrent_runs=8,
+            filesystem_read=True,
         )
 
     async def submit(self, task: TaskContract) -> RunHandle:
         # Hermes TUI creates a session, then acknowledges prompt.submit with
         # {"status": "streaming"}; the terminal answer arrives as events.
-        session = await self._call("session.create", {"label": f"task-{task.id[:8]}"})
+        if task.allowed_paths and task.workspace is None:
+            raise RuntimeError(
+                "Hermes filesystem task requires an authoritative workspace"
+            )
+        session_params = (
+            {"cwd": task.workspace.path}
+            if task.workspace is not None
+            else {"label": f"task-{task.id[:8]}"}
+        )
+        session = await self._call("session.create", session_params)
         session_id = str(session["session_id"])
         correlation_id = f"tui:{session_id}"
         submit_generation = self._connection_generation
