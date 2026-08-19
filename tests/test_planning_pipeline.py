@@ -104,7 +104,7 @@ def test_no_selection_does_not_fabricate_mode_or_plan() -> None:
     assert result.plan is None
 
 
-def test_unsupported_selected_runtime_keeps_observed_mode_decision_but_no_plan() -> None:
+def test_generic_selected_runtime_composes_direct_runtime_plan() -> None:
     result = plan_runtime(
         TaskProfile(),
         TaskRequirements(),
@@ -119,8 +119,9 @@ def test_unsupported_selected_runtime_keeps_observed_mode_decision_but_no_plan()
 
     assert result.selection.selected_runtime == "future_runtime"
     assert result.mode is not None
-    assert result.mode.mode is None
-    assert result.plan is None
+    assert result.mode.mode == "direct"
+    assert result.plan is not None
+    assert result.plan.executor == "future_runtime"
 
 
 def test_selection_time_degraded_fallback_is_not_execution_fallback() -> None:
@@ -286,8 +287,9 @@ def test_hmc_context_is_preserved_when_execution_mode_is_unsupported() -> None:
     assert result.hmc_context is context
     assert result.selection.selected_runtime == "future_runtime"
     assert result.mode is not None
-    assert result.mode.mode is None
-    assert result.plan is None
+    assert result.mode.mode == "direct"
+    assert result.plan is not None
+    assert result.plan.executor == "future_runtime"
 
 
 def test_filesystem_read_capability_fail_closed_then_builds_hermes_runtime_plan() -> None:
