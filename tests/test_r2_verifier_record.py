@@ -218,6 +218,91 @@ def test_cli_record_builder_never_fabricates_unobserved_evidence():
     assert observed_zero.files_changed == []
 
 
+def _build_cli_record(result: dict):
+    from aao_cli.main import _build_execution_record
+
+    return _build_execution_record(
+        task_id="task-cli-truth",
+        result=result,
+        mock=False,
+        started_at="2026-08-10T10:00:00Z",
+        finished_at="2026-08-10T10:00:01Z",
+    )
+
+
+def test_cli_record_builder_preserves_each_supported_terminal_status():
+    for status in ("completed", "failed", "cancelled", "timeout"):
+        record = _build_cli_record({"outcome": status})
+        assert record.status == status
+
+
+def test_cli_record_builder_rejects_unsupported_terminal_status():
+    try:
+        _build_cli_record({"outcome": "abandoned"})
+    except ValueError as exc:
+        assert "unsupported ExecutionRecord outcome" in str(exc)
+    else:
+        raise AssertionError("unsupported outcome must fail closed")
+
+
+def test_cli_record_builder_keeps_missing_output_unknown():
+    record = _build_cli_record({"outcome": "failed", "detail": "control-plane failure"})
+    assert record.output is None
+
+
+def test_cli_record_builder_preserves_observed_empty_output():
+    record = _build_cli_record(
+        {
+            "outcome": "completed",
+            "observed": {"runtime_adapter_invoked": True, "output": ""},
+        }
+    )
+    assert record.output == ""
+
+
+def test_cli_record_builder_does_not_erase_observed_runtime_output_with_empty_detail():
+    record = _build_cli_record(
+        {
+            "outcome": "completed",
+            "detail": "",
+            "observed": {
+                "runtime_adapter_invoked": True,
+                "output": "runtime summary",
+            },
+        }
+    )
+    assert record.output == "runtime summary"
+
+
+def test_cli_record_builder_does_not_label_failure_detail_as_runtime_output():
+    record = _build_cli_record(
+        {
+            "outcome": "failed",
+            "detail": "workspace allocation failed",
+            "observed": {"runtime_adapter_invoked": True, "output": None},
+        }
+    )
+    assert record.output is None
+
+
+def test_cli_record_builder_preserves_non_mock_identity_and_unknown_observations(tmp_path):
+    record = _build_cli_record({"outcome": "failed"})
+
+    assert record.model is None
+    assert record.provider is None
+    assert record.cached_tokens is None
+    assert record.tool_calls is None
+
+    destination = tmp_path / "record.json"
+    record.export(destination)
+    raw = json.loads(destination.read_text())
+    assert raw["schema_version"] == "0.1"
+    assert raw["model"] is None
+    assert raw["provider"] is None
+    assert raw["cached_tokens"] is None
+    assert raw["tool_calls"] is None
+
+
 def test_delegated_summary_preserves_child_evidence_without_parent_fabrication():
     evaluation = EvalResult.aggregate(
         "task-delegated",

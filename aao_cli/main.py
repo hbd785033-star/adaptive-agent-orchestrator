@@ -13,6 +13,23 @@ from rich.table import Table
 app = typer.Typer(name="aao", help="Adaptive Agent Orchestrator — control plane for Hermes")
 console = Console()
 
+_EXECUTION_STATUSES = frozenset({"completed", "failed", "cancelled", "timeout"})
+
+
+def _execution_status(result: dict) -> str:
+    outcome = result.get("outcome")
+    if not isinstance(outcome, str) or outcome not in _EXECUTION_STATUSES:
+        raise ValueError(f"unsupported ExecutionRecord outcome: {outcome!r}")
+    return outcome
+
+
+def _observed_runtime_output(result: dict) -> str | None:
+    observed = result.get("observed")
+    if not isinstance(observed, dict) or observed.get("runtime_adapter_invoked") is not True:
+        return None
+    output = observed.get("output")
+    return output if isinstance(output, str) else None
+
 
 def _build_execution_record(
     *,
@@ -40,7 +57,7 @@ def _build_execution_record(
         run_id=result.get("run_id"),
         model="mock" if mock else None,
         provider="fixture" if mock else None,
-        status="completed" if result.get("outcome") == "completed" else "failed",
+        status=_execution_status(result),
         started_at=started,
         finished_at=finished,
         latency_seconds=(finished - started).total_seconds(),
@@ -54,13 +71,7 @@ def _build_execution_record(
             if isinstance(result.get("files_changed"), list)
             else None
         ),
-        output=(
-            str(result["detail"])
-            if result.get("detail") is not None
-            else str(result["summary"])
-            if result.get("summary") is not None
-            else None
-        ),
+        output=_observed_runtime_output(result),
         workspace_root=result.get("workspace_root"),
         isolation_level=result.get("isolation_level"),
         metadata={
