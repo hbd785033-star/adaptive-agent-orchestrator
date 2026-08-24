@@ -137,7 +137,7 @@ def _task(tmp_path: Path) -> TaskContract:
     )
 
 
-def test_resolver_prefers_direct_node_entrypoint(tmp_path):
+def test_resolver_prefers_direct_node_entrypoint_for_windows_layout(tmp_path):
     root = tmp_path / "node-root"
     node = root / "node.exe"
     shim = root / "codex.cmd"
@@ -148,6 +148,39 @@ def test_resolver_prefers_direct_node_entrypoint(tmp_path):
     js.write_text("", encoding="utf-8")
 
     assert resolve_codex_launch_command([shim]) == [str(node), str(js)]
+
+
+def test_resolver_accepts_windows_standalone_exe(tmp_path):
+    exe = tmp_path / "codex.exe"
+    exe.write_text("", encoding="utf-8")
+
+    assert resolve_codex_launch_command([exe]) == [str(exe)]
+
+
+def test_resolver_uses_windows_cmd_fallback_for_windows_layout(tmp_path, monkeypatch):
+    root = tmp_path / "cmd-root"
+    shim = root / "codex.cmd"
+    cmd = root / "cmd.exe"
+    root.mkdir()
+    shim.write_text("", encoding="utf-8")
+    cmd.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "adapters.codex.app_server.shutil.which",
+        lambda name: str(cmd) if name == "cmd.exe" else None,
+    )
+
+    assert resolve_codex_launch_command([shim]) == [str(cmd), "/d", "/s", "/c", str(shim)]
+
+
+def test_resolver_rejects_missing_windows_layout(tmp_path, monkeypatch):
+    shim = tmp_path / "codex.cmd"
+    shim.write_text("", encoding="utf-8")
+    monkeypatch.setattr("adapters.codex.app_server.shutil.which", lambda _name: None)
+    monkeypatch.delenv("COMSPEC", raising=False)
+
+    with pytest.raises(FileNotFoundError, match="Windows-native Codex"):
+        resolve_codex_launch_command([shim])
 
 
 @pytest.mark.asyncio

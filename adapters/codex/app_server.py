@@ -53,22 +53,26 @@ def _where_codex() -> list[Path]:
     return unique
 
 
+def _is_windows_layout(candidate: Path) -> bool:
+    return os.name == "nt" or candidate.suffix.casefold() in {".cmd", ".exe"}
+
+
 def resolve_codex_launch_command(candidates: Sequence[str | Path] | None = None) -> list[str]:
-    """Resolve a Windows-native launch without relying on a Git-Bash job-control shim."""
+    """Resolve a native Codex launch from the candidate's installation layout."""
     paths = [Path(value) for value in candidates] if candidates is not None else _where_codex()
     for candidate in paths:
         root = candidate.parent
-        node = root / ("node.exe" if os.name == "nt" else "node")
+        node = root / ("node.exe" if _is_windows_layout(candidate) else "node")
         codex_js = root / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
         if node.is_file() and codex_js.is_file():
             return [str(node), str(codex_js)]
     for candidate in paths:
         if candidate.suffix.casefold() == ".exe" and candidate.is_file():
             return [str(candidate)]
-    if os.name == "nt":
-        cmd = shutil.which("cmd.exe") or os.environ.get("COMSPEC")
-        for candidate in paths:
-            if candidate.suffix.casefold() == ".cmd" and candidate.is_file() and cmd:
+    for candidate in paths:
+        if _is_windows_layout(candidate) and candidate.suffix.casefold() == ".cmd" and candidate.is_file():
+            cmd = shutil.which("cmd.exe") or os.environ.get("COMSPEC")
+            if cmd:
                 return [str(cmd), "/d", "/s", "/c", str(candidate)]
     raise FileNotFoundError("no Windows-native Codex launch path was resolved")
 
