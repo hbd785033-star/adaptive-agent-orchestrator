@@ -556,6 +556,14 @@ class HermesAdapter:
                 raise TimeoutError("streaming runtime wait timed out") from exc
         return self._completed_results[handle.run_id]
 
+    async def quiesce(self, handle: RunHandle) -> None:
+        """Hermes owns no local run resource capable of locking workspace cwd.
+
+        Gateway connection lifetime remains adapter-scoped, so this is a
+        truthful run-scoped no-op rather than a per-task disconnect.
+        """
+        del handle
+
     async def result(self, run_id: str) -> AgentResult:
         """Backward-compatible shim; protocol callers should use wait(handle)."""
         handle = self._handles.get(run_id, RunHandle(run_id=run_id, task_id=""))

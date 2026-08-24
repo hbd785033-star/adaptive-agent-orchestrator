@@ -214,6 +214,24 @@ async def test_real_lifecycle_uses_turn_id_and_preserves_structured_evidence(tmp
 
 
 @pytest.mark.asyncio
+async def test_quiesce_settles_codex_process_without_interrupt_or_evidence_loss(tmp_path):
+    launch, log = _launch(tmp_path, "normal")
+    adapter = CodexAppServerAdapter(launch_command=launch)
+    handle = await adapter.submit(_task(tmp_path))
+    result = await adapter.wait(handle)
+
+    await adapter.quiesce(handle)
+    await adapter.quiesce(handle)
+
+    assert adapter._process is None
+    assert result.status == RunStatus.COMPLETED
+    assert (await adapter.usage(handle)).cached_tokens == 2
+    methods = [entry.get("method") for entry in json.loads(log.read_text())]
+    assert "turn/interrupt" not in methods
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("scenario", "expected"), [("missing", None), ("empty", "")])
 async def test_output_none_and_empty_remain_distinct(tmp_path, scenario, expected):
     launch, _ = _launch(tmp_path, scenario)

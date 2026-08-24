@@ -65,7 +65,16 @@ class AgentRuntime(Protocol):
         ...
 
     async def wait(self, handle: RunHandle) -> AgentResult:
-        """Block until run is terminal, then return the result."""
+        """Block until the run reaches a terminal state and return its result."""
+        ...
+
+    async def quiesce(self, handle: RunHandle) -> None:
+        """Release run-scoped resources that could retain workspace authority.
+
+        The run must already be terminal. This operation neither cancels the
+        run nor changes its observed result, and it does not replace the
+        adapter-wide ``disconnect`` lifecycle.
+        """
         ...
 
     async def events(

@@ -93,10 +93,11 @@ class _RunState:
     agent_messages: list[str] = field(default_factory=list)
     completed_tools: list[dict[str, Any]] = field(default_factory=list)
     sequence: int = 0
+    quiesced: bool = False
 
 
 class CodexAppServerAdapter:
-    """One-process, one-active-turn V1 adapter for Codex App Server."""
+    """One-active-turn V1 adapter with process-per-run quiescence."""
 
     def __init__(
         self,
@@ -172,6 +173,11 @@ class CodexAppServerAdapter:
             raise RuntimeError("Codex app-server exited after initialize")
 
     async def disconnect(self) -> None:
+        """Close the adapter-wide lifecycle; idempotent after run quiescence."""
+        await self._stop_process()
+
+    async def _stop_process(self) -> None:
+        """Orderly stop App Server I/O and settle all process reader tasks."""
         self._closing = True
         process, self._process = self._process, None
         if process is not None:
@@ -335,6 +341,18 @@ class CodexAppServerAdapter:
                     )
         assert state.result is not None
         return state.result
+
+    async def quiesce(self, handle: RunHandle) -> None:
+        """Release V1 run-owned App Server process resources after terminal."""
+        state = self._state(handle)
+        if state.quiesced:
+            return
+        if state.result is None or not state.terminal.is_set():
+            raise RuntimeError("Codex run cannot quiesce before a terminal result")
+        await self._stop_process()
+        self._backlog.clear()
+        self._approval_backlog.pop(state.turn_id, None)
+        state.quiesced = True
 
     async def usage(self, handle: RunHandle) -> Usage:
         state = self._state(handle)

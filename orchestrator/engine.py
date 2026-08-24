@@ -445,7 +445,7 @@ class Orchestrator:
         )
 
     async def _cancel_and_confirm_terminal(self, runtime: AgentRuntime, handle) -> None:
-        """Cancel a submitted run and prove terminal state before artifact removal."""
+        """Cancel, prove terminal truth, then release run workspace authority."""
         cancel_error: Exception | None = None
         try:
             await runtime.cancel(handle)
@@ -468,6 +468,13 @@ class Orchestrator:
                 "runtime quiescence could not be established: "
                 f"wait returned non-terminal status {result.status}"
             )
+        try:
+            await runtime.quiesce(handle)
+        except Exception as exc:
+            raise RuntimeError(
+                "runtime quiescence could not be established after "
+                f"terminal status {result.status.value}: {exc}"
+            ) from exc
 
     async def __aenter__(self) -> Orchestrator:
         return self
@@ -780,6 +787,15 @@ class Orchestrator:
                     f"runtime wait returned non-terminal status {agent_result.status}"
                 )
             terminal_outcome = _runtime_terminal_outcome(agent_result.status)
+            try:
+                await runtime.quiesce(handle)
+            except Exception as exc:
+                detail = (
+                    "runtime quiescence failed after observed terminal status "
+                    f"{agent_result.status.value}: {exc}; workspace retained"
+                )
+                await record.mark_failed(detail)
+                return summary("failed", detail)
             if terminal_outcome != "completed":
                 workspace.rollback()
                 detail = agent_result.error or f"runtime ended {terminal_outcome}"
@@ -1005,7 +1021,7 @@ class Orchestrator:
             quarantined_ids = {
                 child.child_id
                 for child in delegation_result.children
-                if child.status == "timeout"
+                if not child.workspace_safe_to_cleanup
             }
 
             # Persist only child usage tied to an observed native runtime run.

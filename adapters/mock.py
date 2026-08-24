@@ -110,6 +110,10 @@ class MockHermesAdapter:
             pass
         return self._build_result(handle.run_id, state)
 
+    async def quiesce(self, handle: RunHandle) -> None:
+        """The in-memory fake owns no workspace-capable run resources."""
+        self._runs[handle.run_id]
+
     async def usage(self, handle: RunHandle) -> Usage:
         s = self._runs[handle.run_id].scenario
         return Usage(

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from aao_cli.main import _build_execution_record, build_runtime_entry
 from adapters.codex.app_server import CodexAppServerAdapter
 from adapters.hermes.gateway import HermesAdapter
@@ -156,3 +158,13 @@ def test_bounded_runtime_factory_knows_adapters_but_not_selection_policy():
     assert isinstance(hermes, HermesAdapter)
     assert codex_identity == "codex-app-server"
     assert isinstance(codex, CodexAppServerAdapter)
+
+
+@pytest.mark.asyncio
+async def test_hermes_quiesce_is_run_scoped_noop_not_disconnect():
+    adapter = HermesAdapter()
+    handle = RunHandle(run_id="run", task_id="task", session_id="session")
+
+    await adapter.quiesce(handle)
+
+    assert adapter._shutdown is False

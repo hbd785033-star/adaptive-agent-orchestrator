@@ -1162,6 +1162,10 @@ worktree:
                     status=RunStatus.CANCELLED,
                 )
 
+            async def quiesce(self, handle):
+                assert self.workspace_path.exists()
+                self.order.append("quiesce")
+
         adapter = TrackingAdapter()
         adapter.enqueue_scenario("pass")
         orch = await build_orch(tmp_path, adapter)
@@ -1180,7 +1184,7 @@ worktree:
         record = orch._sm.get(task.id)
         await orch.close()
 
-        assert adapter.order == ["cancel", "wait"]
+        assert adapter.order == ["cancel", "wait", "quiesce"]
         assert not adapter.workspace_path.exists()
         assert record is not None
         assert record.run_id in adapter._runs
@@ -1219,6 +1223,10 @@ worktree:
                     status=RunStatus.CANCELLED,
                 )
 
+            async def quiesce(self, handle):
+                assert self.workspace_path.exists()
+                self.order.append("quiesce")
+
         adapter = EventFailureAdapter()
         adapter.enqueue_scenario("pass")
         orch = await build_orch(tmp_path, adapter)
@@ -1229,7 +1237,7 @@ worktree:
         record = orch._sm.get(task.id)
         await orch.close()
 
-        assert adapter.order == ["events", "cancel", "wait"]
+        assert adapter.order == ["events", "cancel", "wait", "quiesce"]
         assert not adapter.workspace_path.exists()
         assert record is not None
         assert record.run_id in adapter._runs
@@ -1310,6 +1318,10 @@ worktree:
                     status=RunStatus.CANCELLED,
                 )
 
+            async def quiesce(self, handle):
+                assert self.workspace_paths[handle.run_id].exists()
+                self.order.append((handle.run_id, "quiesce"))
+
         adapter = DelegatedFailureAdapter()
         adapter.enqueue_scenario("pass")
         adapter.enqueue_scenario("pass")
@@ -1334,6 +1346,7 @@ worktree:
                 "events",
                 "cancel",
                 "wait",
+                "quiesce",
             ]
             assert not adapter.workspace_paths[run_id].exists()
 
@@ -1454,3 +1467,115 @@ worktree:
         assert result["outcome"] == "failed"
         assert result["run_id"] is None
         assert {item["run_id"] for item in result["child_runs"]} == set(adapter._runs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_outcome"),
+    [
+        ("completed", "completed"),
+        ("failed", "failed"),
+        ("cancelled", "cancelled"),
+        ("timeout", "timeout"),
+    ],
+)
+async def test_runtime_quiesces_before_workspace_cleanup_for_all_terminal_paths(
+    tmp_path, monkeypatch, terminal_status, expected_outcome
+):
+    from contracts.result import AgentEvent, AgentResult, RunStatus, Usage
+    from orchestrator.workspace import ExecutionWorkspace
+
+    order = []
+
+    class TerminalAdapter(MockHermesAdapter):
+        async def events(self, handle, *, after=None):  # noqa: ANN001
+            event_type = "completed" if terminal_status == "completed" else "error"
+            yield AgentEvent(
+                id="terminal",
+                run_id=handle.run_id,
+                type=event_type,
+                payload={},
+            )
+
+        async def wait(self, handle):  # noqa: ANN001
+            return AgentResult(
+                run_id=handle.run_id,
+                task_id=handle.task_id,
+                status=RunStatus(terminal_status),
+                usage=Usage(input_tokens=0, output_tokens=0, total_tokens=0),
+                files_changed=[],
+                summary="OK" if terminal_status == "completed" else None,
+                error=None if terminal_status == "completed" else terminal_status,
+            )
+
+        async def quiesce(self, handle):  # noqa: ANN001
+            order.append(("quiesce", handle.run_id))
+
+    def rollback(workspace):  # noqa: ANN001
+        order.append(("rollback", None))
+        workspace.cleaned = True
+
+    def cleanup(workspace):  # noqa: ANN001
+        order.append(("cleanup", None))
+        workspace.cleaned = True
+
+    monkeypatch.setattr(ExecutionWorkspace, "rollback", rollback)
+    monkeypatch.setattr(ExecutionWorkspace, "cleanup", cleanup)
+    adapter = TerminalAdapter()
+    orch = await build_orch(tmp_path, adapter)
+    try:
+        result = await orch.run(TaskContract(goal="terminal lifecycle"))
+    finally:
+        await orch.close()
+
+    cleanup_index = next(
+        index for index, (name, _) in enumerate(order) if name in {"rollback", "cleanup"}
+    )
+    quiesce_index = next(index for index, (name, _) in enumerate(order) if name == "quiesce")
+    assert quiesce_index < cleanup_index
+    assert result["outcome"] == expected_outcome
+    assert result["observed"]["runtime_status"] == terminal_status
+
+
+@pytest.mark.asyncio
+async def test_quiescence_failure_preserves_runtime_terminal_truth_and_skips_cleanup(
+    tmp_path, monkeypatch
+):
+    from contracts.result import AgentEvent, AgentResult, RunStatus, Usage
+    from orchestrator.workspace import ExecutionWorkspace
+
+    cleanup_calls = []
+
+    class QuiescenceFailureAdapter(MockHermesAdapter):
+        async def events(self, handle, *, after=None):  # noqa: ANN001
+            yield AgentEvent(id="terminal", run_id=handle.run_id, type="completed", payload={})
+
+        async def wait(self, handle):  # noqa: ANN001
+            return AgentResult(
+                run_id=handle.run_id,
+                task_id=handle.task_id,
+                status=RunStatus.COMPLETED,
+                usage=Usage(input_tokens=0, output_tokens=0, total_tokens=0),
+                files_changed=[],
+                summary="OK",
+            )
+
+        async def quiesce(self, handle):  # noqa: ANN001
+            raise RuntimeError("run resources still own workspace")
+
+    def forbidden_cleanup(_workspace):  # noqa: ANN001
+        cleanup_calls.append("called")
+
+    monkeypatch.setattr(ExecutionWorkspace, "rollback", forbidden_cleanup)
+    monkeypatch.setattr(ExecutionWorkspace, "cleanup", forbidden_cleanup)
+    adapter = QuiescenceFailureAdapter()
+    orch = await build_orch(tmp_path, adapter)
+    try:
+        result = await orch.run(TaskContract(goal="quiescence failure"))
+    finally:
+        await orch.close()
+
+    assert result["outcome"] == "failed"
+    assert result["observed"]["runtime_status"] == "completed"
+    assert "quiescence" in result["detail"]
+    assert cleanup_calls == []

@@ -281,7 +281,7 @@ class DelegationExecutor:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     async def _cancel_and_confirm_terminal(self, handle: RunHandle) -> AgentResult:
-        """Cancel one child and prove it is terminal before cleanup is permitted."""
+        """Cancel one child, prove terminal truth, then release workspace authority."""
         cancel_error: Exception | None = None
         try:
             await self._runtime.cancel(handle)
@@ -304,6 +304,13 @@ class DelegationExecutor:
                 "runtime quiescence could not be established: "
                 f"wait returned non-terminal status {result.status}"
             )
+        try:
+            await self._runtime.quiesce(handle)
+        except Exception as exc:
+            raise RuntimeError(
+                "runtime quiescence could not be established after "
+                f"terminal status {result.status.value}: {exc}"
+            ) from exc
         return result
 
     async def _run_child(
@@ -406,6 +413,19 @@ class DelegationExecutor:
                 raise RuntimeError(
                     f"runtime wait returned non-terminal status {agent_result.status}"
                 )
+            try:
+                await self._runtime.quiesce(handle)
+            except Exception as exc:
+                return ChildExecution(
+                    child_id=child_id,
+                    run_id=handle.run_id,
+                    status=agent_result.status.value,
+                    result=agent_result,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    retry_count=1 if retry else 0,
+                    workspace_safe_to_cleanup=False,
+                    lifecycle_error=str(exc),
+                )
             duration_ms = int((time.monotonic() - t0) * 1000)
 
             if agent_result.status != RunStatus.COMPLETED:
@@ -477,6 +497,8 @@ class DelegationExecutor:
                         status="timeout",
                         duration_ms=duration_ms,
                         retry_count=1 if retry else 0,
+                        workspace_safe_to_cleanup=False,
+                        lifecycle_error=str(quiescence_error),
                     )
             return ChildExecution(
                 child_id=child_id,

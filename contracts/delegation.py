@@ -34,6 +34,8 @@ class ChildExecution(BaseModel):
 
     retry_count: int = 0
     duration_ms: int = 0
+    workspace_safe_to_cleanup: bool = True
+    lifecycle_error: str | None = None
 
     @model_validator(mode="after")
     def retain_current_attempt_identity(self) -> ChildExecution:
