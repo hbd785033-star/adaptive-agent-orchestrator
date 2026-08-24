@@ -81,7 +81,7 @@ class ToolCompletePayload(BaseModel):
 
 
 class CompletedPayload(BaseModel):
-    summary: str = ""
+    summary: str | None = None
     files_changed: list[str] = Field(default_factory=list)
     tests_run: bool = False
     unresolved_risks: list[str] = Field(default_factory=list)

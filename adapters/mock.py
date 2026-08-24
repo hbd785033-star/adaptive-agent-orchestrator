@@ -58,7 +58,7 @@ class MockHermesAdapter:
         self,
         outcome: str = "pass",          # "pass" | "fail" | "approval_required"
         files_changed: list[str] | None = None,
-        summary: str = "Mock task completed",
+        summary: str | None = "Mock task completed",
         error_message: str | None = None,
         input_tokens: int = 500,
         output_tokens: int = 200,
@@ -203,7 +203,7 @@ class MockHermesAdapter:
             yield _evt(
                 "completed",
                 CompletedPayload(
-                    summary=scenario.get("summary", ""),
+                    summary=scenario.get("summary"),
                     files_changed=scenario.get("files_changed", []),
                     tests_run=True,
                     unresolved_risks=[],
@@ -236,7 +236,7 @@ class MockHermesAdapter:
                 ),
             ),
             files_changed=scenario.get("files_changed", []),
-            summary=scenario.get("summary", ""),
+            summary=scenario.get("summary"),
             error=scenario.get("error_message"),
             provenance={"runtime": scenario.get("runtime", _RUNTIME_ID)},
         )

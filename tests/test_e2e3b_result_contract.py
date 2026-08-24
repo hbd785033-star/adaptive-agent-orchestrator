@@ -9,8 +9,10 @@ from aao_cli.main import _build_execution_record, build_runtime_entry
 from adapters.codex.app_server import CodexAppServerAdapter
 from adapters.hermes.gateway import HermesAdapter
 from adapters.mock import MockHermesAdapter
+from contracts.execution import SuccessCriterion
 from contracts.result import AgentEvent, AgentResult, RunHandle, RunStatus, Usage
 from contracts.task import TaskContract
+from evals.gate import check_success_criteria
 from orchestrator.engine import Orchestrator, _runtime_terminal_outcome
 
 
@@ -190,6 +192,69 @@ def test_execution_record_preserves_observed_runtime_not_selected_runtime():
         "codex-app-server"
     )
     assert record.metadata["observed"]["runtime_adapter"] == "different-runtime"
+
+
+@pytest.mark.parametrize(
+    ("terminal", "output", "expected", "criterion_status"),
+    [
+        (RunStatus.COMPLETED, None, "", "fail"),
+        (RunStatus.COMPLETED, "", "", "pass"),
+        (RunStatus.COMPLETED, "OK", "OK", "pass"),
+        (RunStatus.COMPLETED, "NO", "OK", "fail"),
+        (RunStatus.FAILED, "OK", "OK", "fail"),
+        (RunStatus.FAILED, None, "", "fail"),
+    ],
+)
+def test_hermes_output_truth_survives_public_eval_and_execution_record(
+    tmp_path, terminal, output, expected, criterion_status
+):
+    task = TaskContract(
+        id="task-output-truth",
+        goal="verify exact Hermes output",
+        success_criteria=[SuccessCriterion(type="output_equals", value=expected)],
+    )
+    task_record = SimpleNamespace(
+        task=task,
+        run_id="run-output-truth",
+        route="single",
+        retry_count=0,
+    )
+    runtime_result = AgentResult(
+        run_id="run-output-truth",
+        task_id=task.id,
+        status=terminal,
+        summary=output,
+        provenance={"runtime": "hermes"},
+    )
+    public_result = Orchestrator._summary(
+        task_record,
+        terminal.value,
+        "",
+        agent_result=runtime_result,
+        runtime_adapter_invoked=True,
+        observed_runtime="selected-runtime",
+    )
+
+    criterion = check_success_criteria(
+        tmp_path,
+        task,
+        completed=terminal == RunStatus.COMPLETED,
+        observed_output=public_result["observed"]["output"],
+    )
+    execution_record = _build_execution_record(
+        task_id=task.id,
+        result=public_result,
+        mock=False,
+        started_at="2026-08-24T00:00:00Z",
+        finished_at="2026-08-24T00:00:01Z",
+    )
+
+    assert public_result["observed"]["output"] == output
+    assert public_result["observed"]["runtime_adapter"] == "hermes"
+    assert criterion.status.value == criterion_status
+    assert execution_record.schema_version == "0.1"
+    assert execution_record.output == output
+    assert execution_record.metadata["observed"]["runtime_adapter"] == "hermes"
 
 
 def test_hermes_terminal_result_produces_its_own_runtime_identity():
