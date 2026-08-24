@@ -594,6 +594,8 @@ class CodexAppServerAdapter:
                         for path in self._file_paths(item)
                     }
                 )
+        if output is None and state.agent_messages:
+            output = state.agent_messages[-1]
         state.result = AgentResult(
             run_id=state.turn_id,
             task_id=state.handle.task_id,

@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from contracts.evaluation import EvalCheck, EvalResult, EvalStatus
+from contracts.execution import CriterionResult, SuccessCriterion, TaskOutcome
 from contracts.result import AgentResult
 from contracts.task import TaskContract
 from evals.verifier import CriterionVerifier
@@ -161,10 +162,42 @@ def check_read_only(changed_files: list[str], task: TaskContract) -> EvalCheck:
     return EvalCheck(name="read_only", status=EvalStatus.PASS, detail="no repository changes")
 
 
-def check_success_criteria(repo_path: Path, task: TaskContract, completed: bool) -> EvalCheck:
-    """Structured criteria are executable evidence; completion alone never passes them."""
-    from contracts.execution import SuccessCriterion
+def _verify_output_equals(
+    criterion: SuccessCriterion,
+    observed_output: str | None,
+) -> CriterionResult:
+    """Compare exact observed runtime output without fallback or normalization."""
+    if observed_output is None:
+        return CriterionResult(
+            criterion=criterion,
+            passed=False,
+            detail="observed runtime output unavailable",
+        )
+    if criterion.value is None:
+        return CriterionResult(
+            criterion=criterion,
+            passed=False,
+            detail="expected output missing",
+        )
+    passed = observed_output == criterion.value
+    return CriterionResult(
+        criterion=criterion,
+        passed=passed,
+        detail=(
+            "observed runtime output matched exactly"
+            if passed
+            else "observed runtime output did not match expected value"
+        ),
+    )
 
+
+def check_success_criteria(
+    repo_path: Path,
+    task: TaskContract,
+    completed: bool,
+    observed_output: str | None = None,
+) -> EvalCheck:
+    """Structured criteria are executable evidence; completion alone never passes them."""
     unverifiable = [item for item in task.success_criteria if isinstance(item, str)]
     if unverifiable:
         return EvalCheck(
@@ -176,7 +209,14 @@ def check_success_criteria(repo_path: Path, task: TaskContract, completed: bool)
     criteria = [item for item in task.success_criteria if isinstance(item, SuccessCriterion)]
     if not criteria:
         return EvalCheck(name="success_criteria", status=EvalStatus.SKIP, detail="no criteria")
-    outcome = CriterionVerifier(repo_path).verify(criteria, completed=completed)
+    verifier = CriterionVerifier(repo_path)
+    results = []
+    for criterion in criteria:
+        if criterion.type == "output_equals":
+            results.append(_verify_output_equals(criterion, observed_output))
+        else:
+            results.extend(verifier.verify([criterion], completed=completed).criteria)
+    outcome = TaskOutcome(completed=completed, criteria=results)
     failed = [item.detail for item in outcome.criteria if not item.passed]
     return EvalCheck(
         name="success_criteria",
@@ -344,7 +384,10 @@ class DeterministicEvalGate:
         checks.append(check_budget(result, budget))
         checks.append(check_read_only(changed_files, task))
         checks.append(check_success_criteria(
-            effective_repo, task, completed=result.status.value == "completed"
+            effective_repo,
+            task,
+            completed=result.status.value == "completed",
+            observed_output=result.summary,
         ))
 
         # Async checks (run in parallel)

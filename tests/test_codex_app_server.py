@@ -50,7 +50,8 @@ def turn(status, text_marker="normal"):
             }
         ])
     return {
-        "id":turn_id,"status":status,"items":items,"itemsView":"full",
+        "id":turn_id,"status":status,"items":items,
+        "itemsView":"summary" if scenario == "summary_view" else "full",
         "startedAt":1,"completedAt":2,"durationMs":10,"error":None
     }
 
@@ -91,10 +92,11 @@ for raw in sys.stdin:
         elif scenario not in {"interrupt", "timeout"}:
             marker = "missing" if scenario == "missing" else "empty" if scenario == "empty" else "normal"
             status = "failed" if scenario == "failed" else "completed"
-            emit({"method":"item/completed","params":{
-                "threadId":thread_id,"turnId":turn_id,"item":
-                {"id":"agent-1","type":"agentMessage","text":"" if marker=="empty" else "OK"}
-            }})
+            if marker != "missing":
+                emit({"method":"item/completed","params":{
+                    "threadId":thread_id,"turnId":turn_id,"item":
+                    {"id":"agent-1","type":"agentMessage","text":"" if marker=="empty" else "OK"}
+                }})
             emit({"method":"thread/tokenUsage/updated","params":{
                 "threadId":thread_id,"turnId":turn_id,
                 "tokenUsage":{"last":{
@@ -220,6 +222,20 @@ async def test_output_none_and_empty_remain_distinct(tmp_path, scenario, expecte
     handle = await adapter.submit(_task(tmp_path))
     result = await adapter.wait(handle)
     assert result.summary == expected
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_summary_turn_view_retains_observed_agent_message(tmp_path):
+    launch, _ = _launch(tmp_path, "summary_view")
+    adapter = CodexAppServerAdapter(launch_command=launch)
+    await adapter.connect()
+    handle = await adapter.submit(_task(tmp_path))
+
+    result = await adapter.wait(handle)
+
+    assert result.summary == "OK"
+    assert result.provenance["turn_items_view"] == "summary"
     await adapter.disconnect()
 
 

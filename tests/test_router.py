@@ -66,6 +66,13 @@ class TestSuccessCriterionTokenEstimation:
 
         assert estimate_input_tokens(task) > 0
 
+    def test_output_equals_criterion_is_supported(self):
+        task = make_task(success_criteria=[
+            SuccessCriterion(type="output_equals", value="OK")
+        ])
+
+        assert estimate_input_tokens(task) > 0
+
     def test_mixed_string_and_structured_criteria_are_supported(self):
         task = make_task(success_criteria=[
             "runtime completed",
