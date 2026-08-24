@@ -298,6 +298,7 @@ class DelegationExecutor:
             RunStatus.COMPLETED,
             RunStatus.FAILED,
             RunStatus.CANCELLED,
+            RunStatus.TIMEOUT,
         }:
             raise RuntimeError(
                 "runtime quiescence could not be established: "
@@ -399,32 +400,37 @@ class DelegationExecutor:
                 RunStatus.COMPLETED,
                 RunStatus.FAILED,
                 RunStatus.CANCELLED,
+                RunStatus.TIMEOUT,
             }
             if not terminal_confirmed:
                 raise RuntimeError(
                     f"runtime wait returned non-terminal status {agent_result.status}"
                 )
-            usage = await self._runtime.usage(handle)
             duration_ms = int((time.monotonic() - t0) * 1000)
 
-            if agent_result.status == RunStatus.FAILED:
+            if agent_result.status != RunStatus.COMPLETED:
                 log.warning(
-                    "child_agent_failed",
+                    "child_agent_terminal_non_completed",
                     child_id=child_id,
+                    status=agent_result.status.value,
                     error=agent_result.error,
                 )
+                usage = agent_result.usage
                 return ChildExecution(
                     child_id=child_id,
                     run_id=handle.run_id,
-                    status="failed",
+                    status=agent_result.status.value,
                     result=agent_result,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    estimated_cost_usd=usage.estimated_cost_usd,
+                    input_tokens=usage.input_tokens if usage is not None else None,
+                    output_tokens=usage.output_tokens if usage is not None else None,
+                    estimated_cost_usd=(
+                        usage.estimated_cost_usd if usage is not None else None
+                    ),
                     retry_count=1 if retry else 0,
                     duration_ms=duration_ms,
                 )
 
+            usage = await self._runtime.usage(handle)
             # Eval gate
             eval_result: EvalResult = await self._eval_gate.run(
                 task, agent_result, budget
@@ -503,7 +509,8 @@ class DelegationExecutor:
         summaries: list[str] = []
         for child in successful:
             if child.result:
-                all_files.extend(child.result.files_changed)
+                if child.result.files_changed is not None:
+                    all_files.extend(child.result.files_changed)
                 if child.result.summary:
                     summaries.append(f"[{child.child_id}] {child.result.summary}")
 

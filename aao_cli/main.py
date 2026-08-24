@@ -31,6 +31,32 @@ def _observed_runtime_output(result: dict) -> str | None:
     return output if isinstance(output, str) else None
 
 
+def _observed_runtime_identity(result: dict, name: str) -> str | None:
+    observed = result.get("observed")
+    if not isinstance(observed, dict) or observed.get("runtime_adapter_invoked") is not True:
+        return None
+    value = observed.get(name)
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def build_runtime_entry(
+    runtime_name: str,
+    *,
+    hermes_url: str,
+    hermes_key: str | None,
+):
+    """Bounded composition mapping; selection remains RuntimeSelectionPolicy-owned."""
+    if runtime_name == "hermes":
+        from adapters.hermes.gateway import HermesAdapter
+
+        return "hermes", HermesAdapter(url=hermes_url, api_key=hermes_key)
+    if runtime_name == "codex-app-server":
+        from adapters.codex.app_server import CodexAppServerAdapter
+
+        return "codex-app-server", CodexAppServerAdapter()
+    raise ValueError(f"unsupported runtime identity: {runtime_name}")
+
+
 def _build_execution_record(
     *,
     task_id: str,
@@ -55,8 +81,8 @@ def _build_execution_record(
     return ExecutionRecord(
         task_id=task_id,
         run_id=result.get("run_id"),
-        model="mock" if mock else None,
-        provider="fixture" if mock else None,
+        model="mock" if mock else _observed_runtime_identity(result, "model"),
+        provider="fixture" if mock else _observed_runtime_identity(result, "provider"),
         status=_execution_status(result),
         started_at=started,
         finished_at=finished,
@@ -83,7 +109,11 @@ def _build_execution_record(
                 else evaluation.get("overall") if evaluation is not None else None
             ),
             "child_runs": result.get("child_runs"),
-            "identity_observed": mock,
+            "identity_observed": (
+                mock
+                or _observed_runtime_identity(result, "model") is not None
+                or _observed_runtime_identity(result, "provider") is not None
+            ),
             "planned": result.get("planned"),
             "observed": result.get("observed"),
         },
@@ -103,6 +133,7 @@ def run(
     hermes_key: str | None = typer.Option(None, "--key", help="Hermes API key"),
     policy: str = typer.Option("policies/default.yaml", "--policy", help="Policy YAML path"),
     repo: str = typer.Option(".", "--repo", help="Repo path for worktree and evals"),
+    runtime_name: str = typer.Option("hermes", "--runtime", help="Explicit runtime identity"),
     mock: bool = typer.Option(False, "--mock", help="Use mock adapter (no live Hermes)"),
     record_out: Path | None = typer.Option(None, "--record-out", help="Write ExecutionRecord 0.1 JSON"),  # noqa: B008
 ) -> None:
@@ -119,6 +150,7 @@ def run(
         hermes_key=hermes_key,
         policy=policy,
         repo=repo,
+        runtime_name=runtime_name,
         mock=mock,
         record_out=record_out,
     ))
@@ -151,17 +183,36 @@ async def _run_task(**kwargs) -> None:  # noqa: ANN003
     if kwargs["mock"]:
         from adapters.mock import MockHermesAdapter
         runtime: object = MockHermesAdapter()
+        runtime_identity = "mock"
         runtime.enqueue_scenario("pass", summary="mock run completed")  # type: ignore[attr-defined]
     else:
-        from adapters.hermes.gateway import HermesAdapter
-        runtime = HermesAdapter(url=kwargs["hermes_url"], api_key=kwargs["hermes_key"])
+        runtime_identity, runtime = build_runtime_entry(
+            kwargs["runtime_name"],
+            hermes_url=kwargs["hermes_url"],
+            hermes_key=kwargs["hermes_key"],
+        )
 
     started_at = datetime.now(UTC)
-    async with await Orchestrator.build(
-        runtime=runtime,  # type: ignore[arg-type]
-        policy_path=kwargs["policy"],
-        repo_path=kwargs["repo"],
-    ) as orch:
+    build_kwargs = {
+        "policy_path": kwargs["policy"],
+        "repo_path": kwargs["repo"],
+    }
+    if runtime_identity == "codex-app-server":
+        from contracts.runtime_selection import RuntimeSelectionPolicy
+        from orchestrator.runtime_registry import RuntimeRegistry
+
+        build_kwargs.update(
+            runtime_registry=RuntimeRegistry(entries=[(runtime_identity, runtime)]),
+            runtime_selection_policy=RuntimeSelectionPolicy(
+                policy_version="runtime-selection-e2e3b-v1",
+                runtime_priority=(runtime_identity,),
+                allow_degraded_fallback=False,
+            ),
+            planning_required=False,
+        )
+    else:
+        build_kwargs["runtime"] = runtime
+    async with await Orchestrator.build(**build_kwargs) as orch:
         result = await orch.run(task)
 
     if kwargs.get("record_out"):

@@ -327,6 +327,16 @@ class DeterministicEvalGate:
             effective_repo, base_sha=base_sha, include_ignored=False
         )
         changed_files = git_changed if git_changed is not None else result.files_changed
+        if changed_files is None:
+            checks.append(
+                EvalCheck(
+                    name="files_evidence",
+                    status=EvalStatus.FAIL,
+                    detail="changed-file evidence unavailable",
+                    blocker=True,
+                )
+            )
+            changed_files = []
         trusted_result = result.model_copy(update={"files_changed": changed_files})
 
         # Synchronous checks

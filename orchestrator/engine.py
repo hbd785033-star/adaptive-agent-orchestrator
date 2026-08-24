@@ -49,6 +49,16 @@ from telemetry.events import TelemetryRecorder
 log = structlog.get_logger(__name__)
 
 
+def _runtime_terminal_outcome(status: RunStatus) -> str | None:
+    """Return the public execution outcome for terminal runtime evidence."""
+    return {
+        RunStatus.COMPLETED: "completed",
+        RunStatus.FAILED: "failed",
+        RunStatus.CANCELLED: "cancelled",
+        RunStatus.TIMEOUT: "timeout",
+    }.get(status)
+
+
 def _planning_payload(
     evidence: HMCPlanningEvidence,
     planning_result: PlanningResult,
@@ -189,6 +199,7 @@ class Orchestrator:
         runtime_registry: RuntimeRegistry | None = None,
         runtime_selection_policy: RuntimeSelectionPolicy | None = None,
         runtime_health_by_runtime: dict[str, RuntimeHealth] | None = None,
+        planning_required: bool | None = None,
     ) -> Orchestrator:
         import yaml
 
@@ -308,7 +319,9 @@ class Orchestrator:
             runtime_registry=normalized_registry,
             runtime_selection_policy=runtime_selection_policy,
             planning_required=(
-                runtime is None
+                planning_required
+                if planning_required is not None
+                else runtime is None
                 or runtime_registry is not None
                 or model_discoverer is not None
                 or any(
@@ -449,6 +462,7 @@ class Orchestrator:
             RunStatus.COMPLETED,
             RunStatus.FAILED,
             RunStatus.CANCELLED,
+            RunStatus.TIMEOUT,
         }:
             raise RuntimeError(
                 "runtime quiescence could not be established: "
@@ -636,6 +650,7 @@ class Orchestrator:
         runtime_adapter_invoked = False
         observed_events: list[str] = []
         agent_result = None
+        handle = None
         planned_runtime = planning_result.plan.executor if planning_result and planning_result.plan else None
         if (
             planning_result is not None
@@ -655,6 +670,7 @@ class Orchestrator:
                 runtime_adapter_invoked=runtime_adapter_invoked,
                 observed_events=observed_events,
                 agent_result=agent_result,
+                run_handle=handle,
                 observed_runtime=(runtime_identity if runtime_adapter_invoked else None),
                 **extra,
             )
@@ -757,15 +773,18 @@ class Orchestrator:
                 RunStatus.COMPLETED,
                 RunStatus.FAILED,
                 RunStatus.CANCELLED,
+                RunStatus.TIMEOUT,
             }
             if not terminal_confirmed:
                 raise RuntimeError(
                     f"runtime wait returned non-terminal status {agent_result.status}"
                 )
-            if agent_result.status == RunStatus.FAILED:
+            terminal_outcome = _runtime_terminal_outcome(agent_result.status)
+            if terminal_outcome != "completed":
                 workspace.rollback()
-                await record.mark_failed(agent_result.error or "agent reported failure")
-                return summary("failed", agent_result.error or "agent error")
+                detail = agent_result.error or f"runtime ended {terminal_outcome}"
+                await record.mark_failed(detail)
+                return summary(terminal_outcome or "failed", detail)
             usage = await runtime.usage(handle)
         except Exception as exc:
             if not terminal_confirmed:
@@ -1252,6 +1271,7 @@ class Orchestrator:
             d["usage"] = {
                 "input_tokens": u.input_tokens,
                 "output_tokens": u.output_tokens,
+                "cached_tokens": u.cached_tokens,
                 "total_tokens": u.total_tokens,
                 "estimated_cost_usd": u.estimated_cost_usd,
             }
@@ -1265,31 +1285,41 @@ class Orchestrator:
                 d[name] = extra[name]
         planning_evidence = extra.get("planning_evidence")
         planning_result = extra.get("planning_result")
-        if planning_evidence is not None and planning_result is not None:
+        planning_present = planning_evidence is not None and planning_result is not None
+        if planning_present:
             d["planned"] = _planning_payload(planning_evidence, planning_result)
-            observed_result = extra.get("agent_result")
+        observed_result = extra.get("agent_result")
+        run_handle = extra.get("run_handle")
+        runtime_invoked = bool(extra.get("runtime_adapter_invoked", False))
+        if planning_present or runtime_invoked or observed_result is not None:
+            if observed_result is not None:
+                d["tool_calls"] = observed_result.tool_calls
             observed = {
                 "runtime_adapter": extra.get("observed_runtime"),
-                "runtime_adapter_invoked": bool(
-                    extra.get("runtime_adapter_invoked", False)
+                "runtime_adapter_invoked": runtime_invoked,
+                "runtime_version": (
+                    observed_result.runtime_version if observed_result is not None else None
                 ),
                 "run_id": (
                     observed_result.run_id
                     if observed_result is not None
                     else record.run_id
                 ),
+                "session_id": (
+                    run_handle.session_id if run_handle is not None else None
+                ),
                 "runtime_status": (
                     observed_result.status.value
                     if observed_result is not None
                     else None
                 ),
+                "model": observed_result.model if observed_result is not None else None,
+                "provider": observed_result.provider if observed_result is not None else None,
                 "events": list(extra.get("observed_events", [])),
-                "output": (
-                    observed_result.summary
-                    if observed_result is not None and observed_result.summary
-                    else observed_result.error
-                    if observed_result is not None
-                    else None
+                "output": observed_result.summary if observed_result is not None else None,
+                "error": observed_result.error if observed_result is not None else None,
+                "provenance": (
+                    dict(observed_result.provenance) if observed_result is not None else {}
                 ),
             }
             if "usage" in extra:
