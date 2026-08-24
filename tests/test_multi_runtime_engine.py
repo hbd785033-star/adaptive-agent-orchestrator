@@ -414,8 +414,12 @@ async def test_per_runtime_health_and_policy_select_exact_runtime(
 ) -> None:
     hermes = TrackingRuntime(connect_error=hermes_error)
     runtime_b = TrackingRuntime(connect_error=runtime_b_error)
-    hermes.enqueue_scenario("pass", summary="hermes")
-    runtime_b.enqueue_scenario("pass", summary="runtime-b")
+    hermes.enqueue_scenario(
+        "pass", summary="hermes", runtime="hermes-runtime-evidence"
+    )
+    runtime_b.enqueue_scenario(
+        "pass", summary="runtime-b", runtime="runtime-b-evidence"
+    )
     async with await build_multi(
         git_repo,
         tmp_path,
@@ -436,8 +440,45 @@ async def test_per_runtime_health_and_policy_select_exact_runtime(
     other_runtime = hermes if selected == "runtime_b" else runtime_b
     assert expected_runtime.submit_calls == 1
     assert other_runtime.submit_calls == 0
-    assert result["observed"]["runtime_adapter"] == selected
+    expected_observed = {
+        "hermes": "hermes-runtime-evidence",
+        "runtime_b": "runtime-b-evidence",
+    }[selected]
+    assert result["observed"]["runtime_adapter"] == expected_observed
     assert result["observed"]["runtime_adapter_invoked"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runtime_evidence", "expected_observed"),
+    [("different-runtime", "different-runtime"), ("", None)],
+)
+async def test_selected_codex_identity_never_becomes_observed_without_adapter_evidence(
+    git_repo: tuple[Path, Path],
+    tmp_path: Path,
+    runtime_evidence: str,
+    expected_observed: str | None,
+) -> None:
+    repo, policy_path = git_repo
+    runtime = TrackingRuntime()
+    runtime.enqueue_scenario(
+        "pass",
+        summary="OK",
+        runtime=runtime_evidence,
+    )
+    async with await Orchestrator.build(
+        runtime_registry=RuntimeRegistry(entries=[("codex-app-server", runtime)]),
+        runtime_selection_policy=policy("codex-app-server"),
+        planning_required=False,
+        db_path=str(tmp_path / "identity-boundary.db"),
+        repo_path=str(repo),
+        policy_path=str(policy_path),
+    ) as orchestrator:
+        result = await orchestrator.run(task())
+
+    assert runtime.submit_calls == 1
+    assert result["observed"]["runtime_adapter_invoked"] is True
+    assert result["observed"]["runtime_adapter"] == expected_observed
 
 
 @pytest.mark.asyncio

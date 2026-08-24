@@ -22,7 +22,7 @@ from adapters.runtime import AgentRuntime, RuntimeCapabilities
 from contracts.delegation import DelegationResult
 from contracts.evaluation import EvalStatus
 from contracts.execution_mode import ExecutionModePolicy
-from contracts.result import RunStatus
+from contracts.result import AgentResult, RunStatus
 from contracts.runtime_health import HealthStatus, RuntimeHealth
 from contracts.runtime_selection import RuntimeSelectionPolicy
 from contracts.task import TaskContract
@@ -57,6 +57,14 @@ def _runtime_terminal_outcome(status: RunStatus) -> str | None:
         RunStatus.CANCELLED: "cancelled",
         RunStatus.TIMEOUT: "timeout",
     }.get(status)
+
+
+def _observed_runtime_identity(result: AgentResult | None) -> str | None:
+    """Return only runtime identity evidence produced by the invoked adapter."""
+    if result is None:
+        return None
+    runtime = result.provenance.get("runtime")
+    return runtime if isinstance(runtime, str) and runtime.strip() else None
 
 
 def _planning_payload(
@@ -678,7 +686,6 @@ class Orchestrator:
                 observed_events=observed_events,
                 agent_result=agent_result,
                 run_handle=handle,
-                observed_runtime=(runtime_identity if runtime_adapter_invoked else None),
                 **extra,
             )
 
@@ -1311,7 +1318,11 @@ class Orchestrator:
             if observed_result is not None:
                 d["tool_calls"] = observed_result.tool_calls
             observed = {
-                "runtime_adapter": extra.get("observed_runtime"),
+                "runtime_adapter": (
+                    _observed_runtime_identity(observed_result)
+                    if runtime_invoked
+                    else None
+                ),
                 "runtime_adapter_invoked": runtime_invoked,
                 "runtime_version": (
                     observed_result.runtime_version if observed_result is not None else None

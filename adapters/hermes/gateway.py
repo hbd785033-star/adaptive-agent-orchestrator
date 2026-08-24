@@ -39,6 +39,8 @@ from contracts.result import (
 )
 from contracts.task import TaskContract
 
+_RUNTIME_ID = "hermes"
+
 # ── Event type → typed payload parser ────────────────────────────────────────
 
 _TYPED_PARSERS = {
@@ -535,6 +537,7 @@ class HermesAdapter:
                 files_changed=sorted(set(state["files_changed"])),
                 summary=state["summary"],
                 error=state["error"],
+                provenance={"runtime": _RUNTIME_ID},
             )
             self._completion_events.setdefault(handle.run_id, asyncio.Event()).set()
 

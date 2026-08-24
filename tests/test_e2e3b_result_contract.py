@@ -8,7 +8,9 @@ import pytest
 from aao_cli.main import _build_execution_record, build_runtime_entry
 from adapters.codex.app_server import CodexAppServerAdapter
 from adapters.hermes.gateway import HermesAdapter
-from contracts.result import AgentResult, RunHandle, RunStatus, Usage
+from adapters.mock import MockHermesAdapter
+from contracts.result import AgentEvent, AgentResult, RunHandle, RunStatus, Usage
+from contracts.task import TaskContract
 from orchestrator.engine import Orchestrator, _runtime_terminal_outcome
 
 
@@ -61,7 +63,10 @@ def test_summary_preserves_runtime_result_provenance_without_identity_inference(
         model="gpt-real",
         provider="openai",
         runtime_version="0.146.1",
-        provenance={"tool_evidence_completeness": "partial"},
+        provenance={
+            "runtime": "different-runtime",
+            "tool_evidence_completeness": "partial",
+        },
     )
 
     summary = Orchestrator._summary(
@@ -77,7 +82,7 @@ def test_summary_preserves_runtime_result_provenance_without_identity_inference(
     )
 
     assert summary["tool_calls"] == []
-    assert summary["observed"]["runtime_adapter"] == "codex-app-server"
+    assert summary["observed"]["runtime_adapter"] == "different-runtime"
     assert summary["observed"]["runtime_version"] == "0.146.1"
     assert summary["observed"]["session_id"] == "thread"
     assert summary["observed"]["model"] == "gpt-real"
@@ -85,6 +90,130 @@ def test_summary_preserves_runtime_result_provenance_without_identity_inference(
     assert summary["observed"]["output"] == "OK"
     assert summary["usage"]["cached_tokens"] == 1
     assert summary["observed"]["provenance"]["tool_evidence_completeness"] == "partial"
+
+
+def test_summary_does_not_promote_selected_runtime_when_evidence_is_missing():
+    record = SimpleNamespace(
+        task=SimpleNamespace(id="task"), run_id="turn", route="single", retry_count=0
+    )
+    runtime_result = AgentResult(
+        run_id="turn",
+        task_id="task",
+        status=RunStatus.COMPLETED,
+        provenance={},
+    )
+
+    summary = Orchestrator._summary(
+        record,
+        "completed",
+        "",
+        agent_result=runtime_result,
+        observed_runtime="codex-app-server",
+        runtime_adapter_invoked=True,
+    )
+
+    assert summary["observed"]["runtime_adapter"] is None
+
+
+@pytest.mark.parametrize("status", [RunStatus.COMPLETED, RunStatus.FAILED])
+def test_summary_preserves_runtime_produced_identity_for_terminal_results(status):
+    record = SimpleNamespace(
+        task=SimpleNamespace(id="task"), run_id="turn", route="single", retry_count=0
+    )
+    runtime_result = AgentResult(
+        run_id="turn",
+        task_id="task",
+        status=status,
+        provenance={"runtime": "codex-app-server"},
+    )
+
+    summary = Orchestrator._summary(
+        record,
+        status.value,
+        "",
+        agent_result=runtime_result,
+        observed_runtime="selected-runtime",
+        runtime_adapter_invoked=True,
+    )
+
+    assert summary["observed"]["runtime_adapter"] == "codex-app-server"
+
+
+def test_summary_ignores_runtime_evidence_when_runtime_was_never_invoked():
+    record = SimpleNamespace(
+        task=SimpleNamespace(id="task"), run_id=None, route="single", retry_count=0
+    )
+    runtime_result = AgentResult(
+        run_id=None,
+        task_id="task",
+        status=RunStatus.FAILED,
+        provenance={"runtime": "codex-app-server"},
+    )
+
+    summary = Orchestrator._summary(
+        record,
+        "failed",
+        "",
+        agent_result=runtime_result,
+        observed_runtime="selected-runtime",
+        runtime_adapter_invoked=False,
+    )
+
+    assert summary["observed"]["runtime_adapter"] is None
+
+
+def test_execution_record_preserves_observed_runtime_not_selected_runtime():
+    result = {
+        "outcome": "completed",
+        "run_id": "turn-real",
+        "planned": {
+            "runtime_selection": {"selected_runtime": "codex-app-server"},
+            "runtime_plan": {"executor": "codex-app-server"},
+        },
+        "observed": {
+            "runtime_adapter": "different-runtime",
+            "runtime_adapter_invoked": True,
+            "output": "OK",
+        },
+    }
+
+    record = _build_execution_record(
+        task_id="task",
+        result=result,
+        mock=False,
+        started_at="2026-08-21T00:00:00Z",
+        finished_at="2026-08-21T00:00:01Z",
+    )
+
+    assert record.schema_version == "0.1"
+    assert record.metadata["planned"]["runtime_selection"]["selected_runtime"] == (
+        "codex-app-server"
+    )
+    assert record.metadata["observed"]["runtime_adapter"] == "different-runtime"
+
+
+def test_hermes_terminal_result_produces_its_own_runtime_identity():
+    adapter = HermesAdapter()
+    handle = RunHandle(run_id="run", task_id="task", session_id="session")
+    adapter._record_event(
+        handle,
+        AgentEvent(id="completed", run_id="run", type="completed", payload={}),
+    )
+
+    result = adapter._completed_results["run"]
+
+    assert result.provenance["runtime"] == "hermes"
+
+
+@pytest.mark.asyncio
+async def test_mock_runtime_produces_explicit_scenario_identity():
+    adapter = MockHermesAdapter()
+    adapter.enqueue_scenario("pass", runtime="runtime-c")
+
+    handle = await adapter.submit(TaskContract(id="task", goal="identity proof"))
+    result = await adapter.wait(handle)
+
+    assert result.provenance["runtime"] == "runtime-c"
 
 
 def test_execution_record_exports_real_codex_identity_and_unknown_cost():
