@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import pytest
 
+from contracts.execution import SuccessCriterion
 from contracts.task import SubtaskSpec, TaskContract, TaskType
-from orchestrator.router import RuleRouter
+from orchestrator.router import RuleRouter, estimate_input_tokens
 
 
 @pytest.fixture
@@ -49,6 +50,67 @@ def make_task(**kwargs) -> TaskContract:
     defaults = dict(goal="fix the login bug", task_type=TaskType.GENERAL, complexity=1)
     defaults.update(kwargs)
     return TaskContract(**defaults)
+
+
+class TestSuccessCriterionTokenEstimation:
+    def test_string_criteria_preserve_existing_estimate(self):
+        task = make_task(success_criteria=["tests pass", "no warnings"])
+        expected_text = task.goal + str(task.context) + "tests pass no warnings"
+
+        assert estimate_input_tokens(task) == int(len(expected_text) / 3.5)
+
+    def test_structured_criterion_is_supported(self):
+        task = make_task(success_criteria=[
+            SuccessCriterion(type="file_contains", target="result.txt", value="OK")
+        ])
+
+        assert estimate_input_tokens(task) > 0
+
+    def test_output_equals_criterion_is_supported(self):
+        task = make_task(success_criteria=[
+            SuccessCriterion(type="output_equals", value="OK")
+        ])
+
+        assert estimate_input_tokens(task) > 0
+
+    def test_mixed_string_and_structured_criteria_are_supported(self):
+        task = make_task(success_criteria=[
+            "runtime completed",
+            SuccessCriterion(type="file_contains", target="result.txt", value="OK"),
+        ])
+
+        assert estimate_input_tokens(task) > 0
+
+    def test_structured_criterion_estimate_is_deterministic(self):
+        criterion = SuccessCriterion(type="file_contains", target="result.txt", value="OK")
+        first = make_task(success_criteria=[criterion])
+        second = make_task(success_criteria=[criterion.model_copy()])
+
+        assert estimate_input_tokens(first) == estimate_input_tokens(second)
+
+    def test_structured_criterion_fields_contribute_to_estimate(self):
+        minimal = make_task(success_criteria=[SuccessCriterion(type="file_contains")])
+        detailed = make_task(success_criteria=[
+            SuccessCriterion(
+                type="file_contains",
+                target="artifacts/" + "result-" * 40 + ".txt",
+                value="verified-" * 40,
+            )
+        ])
+
+        assert estimate_input_tokens(detailed) > estimate_input_tokens(minimal)
+
+    def test_estimation_never_executes_criterion(self, tmp_path):
+        marker = tmp_path / "executed.txt"
+        task = make_task(success_criteria=[
+            SuccessCriterion(
+                type="command",
+                command=["python", "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"],
+            )
+        ])
+
+        assert estimate_input_tokens(task) > 0
+        assert not marker.exists()
 
 
 class TestSequentialDependencyForcesSingle:

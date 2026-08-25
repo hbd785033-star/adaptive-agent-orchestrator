@@ -5,6 +5,8 @@ import json
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from contracts.delegation import ChildExecution, DelegationResult
 from contracts.evaluation import EvalCheck, EvalResult, EvalStatus
 from contracts.execution import ExecutionRecord, SuccessCriterion, TaskOutcome
@@ -76,6 +78,82 @@ def test_mixed_criteria_cannot_pass_with_unverifiable_string(tmp_path):
 
     assert check.status.value == "fail"
     assert "unverifiable" in check.detail
+
+
+def test_output_equals_criterion_is_accepted_by_task_contract():
+    task = TaskContract(
+        goal="reply exactly",
+        success_criteria=[SuccessCriterion(type="output_equals", value="OK")],
+    )
+
+    assert task.success_criteria[0].type == "output_equals"
+
+
+@pytest.mark.parametrize(
+    ("observed_output", "expected", "completed", "status"),
+    [
+        ("OK", "OK", True, "pass"),
+        ("NO", "OK", True, "fail"),
+        ("", "", True, "pass"),
+        (None, "", True, "fail"),
+        (None, "OK", True, "fail"),
+        ("OK", "OK", False, "fail"),
+    ],
+)
+def test_output_equals_uses_exact_observed_output(
+    tmp_path, observed_output, expected, completed, status
+):
+    task = TaskContract(
+        goal="reply exactly",
+        success_criteria=[SuccessCriterion(type="output_equals", value=expected)],
+    )
+
+    check = check_success_criteria(
+        tmp_path,
+        task,
+        completed=completed,
+        observed_output=observed_output,
+    )
+
+    assert check.status.value == status
+
+
+def test_output_equals_combines_with_workspace_criteria(tmp_path):
+    (tmp_path / "proof.txt").write_text("verified\n")
+    task = TaskContract(
+        goal="verify output and workspace",
+        success_criteria=[
+            SuccessCriterion(type="output_equals", value="OK"),
+            SuccessCriterion(type="file_exists", target="proof.txt"),
+            SuccessCriterion(type="file_contains", target="proof.txt", value="verified"),
+        ],
+    )
+
+    check = check_success_criteria(
+        tmp_path,
+        task,
+        completed=True,
+        observed_output="OK",
+    )
+
+    assert check.status.value == "pass"
+
+
+def test_prompt_summary_and_detail_do_not_supply_observed_output(tmp_path):
+    task = TaskContract(
+        goal="Reply with exactly OK",
+        context={"summary": "OK", "detail": "OK"},
+        success_criteria=[SuccessCriterion(type="output_equals", value="OK")],
+    )
+
+    check = check_success_criteria(
+        tmp_path,
+        task,
+        completed=True,
+        observed_output=None,
+    )
+
+    assert check.status.value == "fail"
 
 
 def test_verifier_v1_types(tmp_path):

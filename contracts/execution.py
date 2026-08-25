@@ -8,7 +8,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, computed_field
 
 CriterionType = Literal[
-    "pytest", "command", "file_exists", "file_contains", "git_diff", "registered"
+    "pytest",
+    "command",
+    "file_exists",
+    "file_contains",
+    "git_diff",
+    "registered",
+    "output_equals",
 ]
 
 

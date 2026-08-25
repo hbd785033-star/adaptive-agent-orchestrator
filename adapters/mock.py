@@ -27,6 +27,8 @@ from contracts.result import (
 from contracts.task import TaskContract
 from orchestrator.cost import estimate_cost
 
+_RUNTIME_ID = "mock-hermes"
+
 
 class _RunState:
     def __init__(self, task_id: str, scenario: dict[str, Any]) -> None:
@@ -56,11 +58,12 @@ class MockHermesAdapter:
         self,
         outcome: str = "pass",          # "pass" | "fail" | "approval_required"
         files_changed: list[str] | None = None,
-        summary: str = "Mock task completed",
+        summary: str | None = "Mock task completed",
         error_message: str | None = None,
         input_tokens: int = 500,
         output_tokens: int = 200,
         model: str = "claude-sonnet-4",
+        runtime: str = _RUNTIME_ID,
         extra_events: list[dict] | None = None,
     ) -> None:
         self._scenario_queue.append(
@@ -72,6 +75,7 @@ class MockHermesAdapter:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 model=model,
+                runtime=runtime,
                 extra_events=extra_events or [],
             )
         )
@@ -109,6 +113,10 @@ class MockHermesAdapter:
         async for _ in self.events(handle):
             pass
         return self._build_result(handle.run_id, state)
+
+    async def quiesce(self, handle: RunHandle) -> None:
+        """The in-memory fake owns no workspace-capable run resources."""
+        self._runs[handle.run_id]
 
     async def usage(self, handle: RunHandle) -> Usage:
         s = self._runs[handle.run_id].scenario
@@ -195,7 +203,7 @@ class MockHermesAdapter:
             yield _evt(
                 "completed",
                 CompletedPayload(
-                    summary=scenario.get("summary", ""),
+                    summary=scenario.get("summary"),
                     files_changed=scenario.get("files_changed", []),
                     tests_run=True,
                     unresolved_risks=[],
@@ -228,6 +236,7 @@ class MockHermesAdapter:
                 ),
             ),
             files_changed=scenario.get("files_changed", []),
-            summary=scenario.get("summary", ""),
+            summary=scenario.get("summary"),
             error=scenario.get("error_message"),
+            provenance={"runtime": scenario.get("runtime", _RUNTIME_ID)},
         )

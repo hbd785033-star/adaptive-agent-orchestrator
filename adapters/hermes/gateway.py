@@ -39,6 +39,8 @@ from contracts.result import (
 )
 from contracts.task import TaskContract
 
+_RUNTIME_ID = "hermes"
+
 # ── Event type → typed payload parser ────────────────────────────────────────
 
 _TYPED_PARSERS = {
@@ -84,8 +86,9 @@ def _normalize_gateway_event(data: dict) -> tuple[str, str | None, dict]:
                 "code": "hermes_message_complete_error",
                 "message": str(payload.get("text") or "Hermes turn failed"),
             }
+        output = payload.get("text")
         return session_id, "completed", {
-            "summary": str(payload.get("text") or ""),
+            "summary": output if isinstance(output, str) else None,
             "files_changed": payload.get("files_changed", []),
             "tests_run": payload.get("tests_run", False),
             "unresolved_risks": payload.get("unresolved_risks", []),
@@ -383,7 +386,7 @@ class HermesAdapter:
         self._handles[correlation_id] = handle
         self._run_state[correlation_id] = {
             "files_changed": [],
-            "summary": "",
+            "summary": None,
             "error": None,
             "usage": None,
             "status": RunStatus.RUNNING,
@@ -503,7 +506,7 @@ class HermesAdapter:
             self._completion_events.setdefault(handle.run_id, asyncio.Event()).set()
             return
         state = self._run_state.setdefault(handle.run_id, {
-            "files_changed": [], "summary": "", "error": None,
+            "files_changed": [], "summary": None, "error": None,
             "usage": None, "status": RunStatus.RUNNING,
         })
         if event.type == "completed":
@@ -512,7 +515,7 @@ class HermesAdapter:
                 state["summary"] = event.typed_payload.summary
             else:
                 state["files_changed"].extend(event.payload.get("files_changed", []))
-                state["summary"] = event.payload.get("summary", "")
+                state["summary"] = event.payload.get("summary")
             state["status"] = RunStatus.COMPLETED
         elif event.type == "tool_complete" and isinstance(event.typed_payload, ToolCompletePayload):
             state["files_changed"].extend(event.typed_payload.files_written)
@@ -535,6 +538,7 @@ class HermesAdapter:
                 files_changed=sorted(set(state["files_changed"])),
                 summary=state["summary"],
                 error=state["error"],
+                provenance={"runtime": _RUNTIME_ID},
             )
             self._completion_events.setdefault(handle.run_id, asyncio.Event()).set()
 
@@ -555,6 +559,14 @@ class HermesAdapter:
             except TimeoutError as exc:
                 raise TimeoutError("streaming runtime wait timed out") from exc
         return self._completed_results[handle.run_id]
+
+    async def quiesce(self, handle: RunHandle) -> None:
+        """Hermes owns no local run resource capable of locking workspace cwd.
+
+        Gateway connection lifetime remains adapter-scoped, so this is a
+        truthful run-scoped no-op rather than a per-task disconnect.
+        """
+        del handle
 
     async def result(self, run_id: str) -> AgentResult:
         """Backward-compatible shim; protocol callers should use wait(handle)."""

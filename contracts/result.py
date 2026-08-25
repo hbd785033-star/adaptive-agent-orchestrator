@@ -14,6 +14,7 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
     APPROVAL_REQUIRED = "approval_required"
 
 
@@ -27,6 +28,7 @@ class RunHandle(BaseModel):
 class Usage(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cached_tokens: int | None = None
     total_tokens: int | None = None
     estimated_cost_usd: float | None = None
 
@@ -34,6 +36,7 @@ class Usage(BaseModel):
         return Usage(
             input_tokens=_sum_observed(self.input_tokens, other.input_tokens),
             output_tokens=_sum_observed(self.output_tokens, other.output_tokens),
+            cached_tokens=_sum_observed(self.cached_tokens, other.cached_tokens),
             total_tokens=_sum_observed(self.total_tokens, other.total_tokens),
             estimated_cost_usd=_sum_observed(
                 self.estimated_cost_usd, other.estimated_cost_usd
@@ -78,7 +81,7 @@ class ToolCompletePayload(BaseModel):
 
 
 class CompletedPayload(BaseModel):
-    summary: str = ""
+    summary: str | None = None
     files_changed: list[str] = Field(default_factory=list)
     tests_run: bool = False
     unresolved_risks: list[str] = Field(default_factory=list)
@@ -97,8 +100,13 @@ class AgentResult(BaseModel):
     task_id: str
     status: RunStatus
     usage: Usage | None = None
-    files_changed: list[str] = Field(default_factory=list)
-    summary: str = ""
+    files_changed: list[str] | None = None
+    summary: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    model: str | None = None
+    provider: str | None = None
+    runtime_version: str | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
     unresolved_risks: list[str] = Field(default_factory=list)
     tests_run: bool = False
     error: str | None = None

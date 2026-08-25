@@ -16,6 +16,7 @@ from typing import Literal
 
 import yaml
 
+from contracts.execution import SuccessCriterion
 from contracts.task import TaskContract
 
 Route = Literal["single", "delegation"]
@@ -37,12 +38,22 @@ class RoutingDecision:
 
 # ── Token estimator (heuristic v1) ───────────────────────────────────────────
 
+def _criterion_estimation_text(criterion: str | SuccessCriterion) -> str:
+    """Return deterministic criterion text without evaluating the criterion."""
+    if isinstance(criterion, str):
+        return criterion
+    return criterion.model_dump_json(exclude_none=True)
+
+
 def estimate_input_tokens(task: TaskContract) -> int:
     """
     Rough character-to-token ratio. Accurate enough to gate routing.
     Replace with tiktoken if precision matters later.
     """  # heuristic v1
-    text = task.goal + str(task.context) + " ".join(task.success_criteria)
+    criteria_text = " ".join(
+        _criterion_estimation_text(criterion) for criterion in task.success_criteria
+    )
+    text = task.goal + str(task.context) + criteria_text
     return int(len(text) / 3.5)
 
 

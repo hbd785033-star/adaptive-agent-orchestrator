@@ -6,18 +6,20 @@ import subprocess
 import pytest
 
 from contracts.evaluation import EvalStatus
+from contracts.execution import SuccessCriterion
 from contracts.result import AgentResult, RunStatus, Usage
 from contracts.task import TaskContract, WorkspaceSpec
 from evals.gate import DeterministicEvalGate, check_budget, check_paths
 from orchestrator.budget import BudgetConfig, BudgetState
 
 
-def make_result(files_changed: list[str]) -> AgentResult:
+def make_result(files_changed: list[str], *, summary: str | None = None) -> AgentResult:
     return AgentResult(
         run_id="run-1",
         task_id="task-1",
         status=RunStatus.COMPLETED,
         files_changed=files_changed,
+        summary=summary,
         usage=Usage(input_tokens=100, output_tokens=50, total_tokens=150),
     )
 
@@ -117,6 +119,39 @@ class TestCheckBudget:
 
     def test_over_limit_fails(self):
         check = check_budget(make_result([]), make_budget(calls=10, max_calls=8))
+        assert check.status == EvalStatus.FAIL
+
+
+class TestObservedOutputCriteria:
+    @pytest.mark.asyncio
+    async def test_gate_supplies_authoritative_runtime_output(self, tmp_path):
+        task = TaskContract(
+            goal="reply exactly",
+            success_criteria=[SuccessCriterion(type="output_equals", value="OK")],
+        )
+
+        evaluated = await DeterministicEvalGate(tmp_path).run(
+            task,
+            make_result([], summary="OK"),
+            make_budget(),
+        )
+
+        check = next(item for item in evaluated.checks if item.name == "success_criteria")
+        assert check.status == EvalStatus.PASS
+
+    @pytest.mark.asyncio
+    async def test_gate_does_not_use_runtime_error_as_output(self, tmp_path):
+        task = TaskContract(
+            goal="reply exactly",
+            context={"detail": "OK"},
+            success_criteria=[SuccessCriterion(type="output_equals", value="OK")],
+        )
+        result = make_result([], summary=None)
+        result.error = "OK"
+
+        evaluated = await DeterministicEvalGate(tmp_path).run(task, result, make_budget())
+
+        check = next(item for item in evaluated.checks if item.name == "success_criteria")
         assert check.status == EvalStatus.FAIL
 
 

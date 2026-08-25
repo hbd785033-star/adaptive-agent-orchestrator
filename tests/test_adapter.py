@@ -6,7 +6,12 @@ import json
 
 import pytest
 
-from adapters.hermes.gateway import HermesAdapter, _build_ws_url, _parse_event
+from adapters.hermes.gateway import (
+    HermesAdapter,
+    _build_ws_url,
+    _normalize_gateway_event,
+    _parse_event,
+)
 from adapters.mock import MockHermesAdapter
 from adapters.runtime import AgentRuntime
 from contracts.result import RunHandle, RunStatus
@@ -319,6 +324,88 @@ async def test_clean_websocket_close_fails_active_stream_run() -> None:
 
 
 class TestHermesAdapterContract:
+    @pytest.mark.parametrize(
+        ("native_payload", "expected_output"),
+        [
+            ({}, None),
+            ({"text": None}, None),
+            ({"text": ""}, ""),
+            ({"text": "OK"}, "OK"),
+        ],
+    )
+    def test_native_completed_output_preserves_unknown_empty_and_non_empty(
+        self, native_payload, expected_output
+    ):
+        session_id, event_type, payload = _normalize_gateway_event(
+            {
+                "params": {
+                    "session_id": "session-output",
+                    "type": "message.complete",
+                    "payload": native_payload,
+                }
+            }
+        )
+        adapter = HermesAdapter()
+        handle = RunHandle(
+            run_id="run-output",
+            task_id="task-output",
+            session_id=session_id,
+        )
+
+        adapter._record_event(
+            handle,
+            _parse_event(
+                {
+                    "run_id": handle.run_id,
+                    "type": event_type,
+                    "payload": payload,
+                }
+            ),
+        )
+
+        result = adapter._completed_results[handle.run_id]
+        assert result.summary == expected_output
+        assert result.provenance["runtime"] == "hermes"
+
+    def test_error_only_terminal_preserves_unknown_output(self):
+        adapter = HermesAdapter()
+        handle = RunHandle(run_id="run-error", task_id="task-error")
+
+        adapter._record_event(
+            handle,
+            _parse_event(
+                {
+                    "run_id": handle.run_id,
+                    "type": "error",
+                    "payload": {"code": "failed", "message": "runtime failed"},
+                }
+            ),
+        )
+
+        result = adapter._completed_results[handle.run_id]
+        assert result.status == RunStatus.FAILED
+        assert result.summary is None
+        assert result.provenance["runtime"] == "hermes"
+
+    @pytest.mark.asyncio
+    async def test_submitted_error_only_run_preserves_unknown_output(self):
+        adapter = StreamingGatewayAdapter(
+            [
+                {
+                    "run_id": "tui:session-stream",
+                    "type": "error",
+                    "payload": {"code": "failed", "message": "runtime failed"},
+                }
+            ]
+        )
+
+        handle = await adapter.submit(make_task())
+        result = await adapter.wait(handle)
+
+        assert result.status == RunStatus.FAILED
+        assert result.summary is None
+        assert result.provenance["runtime"] == "hermes"
+
     @pytest.mark.asyncio
     async def test_real_adapter_satisfies_runtime_protocol_and_uses_run_handles(self):
         adapter = FakeGatewayAdapter()
@@ -702,6 +789,26 @@ class TestHermesAdapterContract:
 
 
 class TestMockAdapter:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("scenario", "expected_output"),
+        [
+            ({"summary": None}, None),
+            ({"summary": ""}, ""),
+            ({"summary": "OK"}, "OK"),
+        ],
+    )
+    async def test_result_preserves_unknown_empty_and_non_empty_output(
+        self, scenario, expected_output
+    ):
+        adapter = MockHermesAdapter()
+        adapter.enqueue_scenario("pass", **scenario)
+
+        handle = await adapter.submit(make_task())
+        result = await adapter.wait(handle)
+
+        assert result.summary == expected_output
+
     @pytest.mark.asyncio
     async def test_submit_returns_handle(self):
         adapter = MockHermesAdapter()

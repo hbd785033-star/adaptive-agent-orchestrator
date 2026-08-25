@@ -281,7 +281,7 @@ class DelegationExecutor:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     async def _cancel_and_confirm_terminal(self, handle: RunHandle) -> AgentResult:
-        """Cancel one child and prove it is terminal before cleanup is permitted."""
+        """Cancel one child, prove terminal truth, then release workspace authority."""
         cancel_error: Exception | None = None
         try:
             await self._runtime.cancel(handle)
@@ -298,11 +298,19 @@ class DelegationExecutor:
             RunStatus.COMPLETED,
             RunStatus.FAILED,
             RunStatus.CANCELLED,
+            RunStatus.TIMEOUT,
         }:
             raise RuntimeError(
                 "runtime quiescence could not be established: "
                 f"wait returned non-terminal status {result.status}"
             )
+        try:
+            await self._runtime.quiesce(handle)
+        except Exception as exc:
+            raise RuntimeError(
+                "runtime quiescence could not be established after "
+                f"terminal status {result.status.value}: {exc}"
+            ) from exc
         return result
 
     async def _run_child(
@@ -399,32 +407,50 @@ class DelegationExecutor:
                 RunStatus.COMPLETED,
                 RunStatus.FAILED,
                 RunStatus.CANCELLED,
+                RunStatus.TIMEOUT,
             }
             if not terminal_confirmed:
                 raise RuntimeError(
                     f"runtime wait returned non-terminal status {agent_result.status}"
                 )
-            usage = await self._runtime.usage(handle)
-            duration_ms = int((time.monotonic() - t0) * 1000)
-
-            if agent_result.status == RunStatus.FAILED:
-                log.warning(
-                    "child_agent_failed",
-                    child_id=child_id,
-                    error=agent_result.error,
-                )
+            try:
+                await self._runtime.quiesce(handle)
+            except Exception as exc:
                 return ChildExecution(
                     child_id=child_id,
                     run_id=handle.run_id,
-                    status="failed",
+                    status=agent_result.status.value,
                     result=agent_result,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    estimated_cost_usd=usage.estimated_cost_usd,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    retry_count=1 if retry else 0,
+                    workspace_safe_to_cleanup=False,
+                    lifecycle_error=str(exc),
+                )
+            duration_ms = int((time.monotonic() - t0) * 1000)
+
+            if agent_result.status != RunStatus.COMPLETED:
+                log.warning(
+                    "child_agent_terminal_non_completed",
+                    child_id=child_id,
+                    status=agent_result.status.value,
+                    error=agent_result.error,
+                )
+                usage = agent_result.usage
+                return ChildExecution(
+                    child_id=child_id,
+                    run_id=handle.run_id,
+                    status=agent_result.status.value,
+                    result=agent_result,
+                    input_tokens=usage.input_tokens if usage is not None else None,
+                    output_tokens=usage.output_tokens if usage is not None else None,
+                    estimated_cost_usd=(
+                        usage.estimated_cost_usd if usage is not None else None
+                    ),
                     retry_count=1 if retry else 0,
                     duration_ms=duration_ms,
                 )
 
+            usage = await self._runtime.usage(handle)
             # Eval gate
             eval_result: EvalResult = await self._eval_gate.run(
                 task, agent_result, budget
@@ -471,6 +497,8 @@ class DelegationExecutor:
                         status="timeout",
                         duration_ms=duration_ms,
                         retry_count=1 if retry else 0,
+                        workspace_safe_to_cleanup=False,
+                        lifecycle_error=str(quiescence_error),
                     )
             return ChildExecution(
                 child_id=child_id,
@@ -503,7 +531,8 @@ class DelegationExecutor:
         summaries: list[str] = []
         for child in successful:
             if child.result:
-                all_files.extend(child.result.files_changed)
+                if child.result.files_changed is not None:
+                    all_files.extend(child.result.files_changed)
                 if child.result.summary:
                     summaries.append(f"[{child.child_id}] {child.result.summary}")
 
