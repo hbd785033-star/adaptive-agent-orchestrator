@@ -5,10 +5,14 @@ import asyncio
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
 from rich.table import Table
+
+if TYPE_CHECKING:
+    from contracts.experiment_profile import AAOExperimentV1
 
 app = typer.Typer(name="aao", help="Adaptive Agent Orchestrator — control plane for Hermes")
 console = Console()
@@ -64,6 +68,7 @@ def _build_execution_record(
     mock: bool,
     started_at: datetime | str,
     finished_at: datetime | str,
+    experiment: AAOExperimentV1 | None = None,
 ):
     """Build truthful evidence: absent observations remain explicitly unknown."""
     from contracts.execution import ExecutionRecord
@@ -77,6 +82,28 @@ def _build_execution_record(
     finished = as_datetime(finished_at)
     usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
     evaluation = result.get("eval") if isinstance(result.get("eval"), dict) else None
+    metadata = {
+        "route": result.get("route"),
+        "retries": result.get("retry_count"),
+        "verification_status": (
+            result.get("verification_status")
+            if "verification_status" in result
+            else evaluation.get("overall") if evaluation is not None else None
+        ),
+        "child_runs": result.get("child_runs"),
+        "identity_observed": (
+            mock
+            or _observed_runtime_identity(result, "model") is not None
+            or _observed_runtime_identity(result, "provider") is not None
+        ),
+        "planned": result.get("planned"),
+        "observed": result.get("observed"),
+    }
+    if experiment is not None:
+        from contracts.experiment_profile import AAOExperimentV1
+
+        validated_experiment = AAOExperimentV1.model_validate(experiment)
+        metadata["aao_experiment_v1"] = validated_experiment.model_dump(mode="json")
 
     return ExecutionRecord(
         task_id=task_id,
@@ -100,23 +127,7 @@ def _build_execution_record(
         output=_observed_runtime_output(result),
         workspace_root=result.get("workspace_root"),
         isolation_level=result.get("isolation_level"),
-        metadata={
-            "route": result.get("route"),
-            "retries": result.get("retry_count"),
-            "verification_status": (
-                result.get("verification_status")
-                if "verification_status" in result
-                else evaluation.get("overall") if evaluation is not None else None
-            ),
-            "child_runs": result.get("child_runs"),
-            "identity_observed": (
-                mock
-                or _observed_runtime_identity(result, "model") is not None
-                or _observed_runtime_identity(result, "provider") is not None
-            ),
-            "planned": result.get("planned"),
-            "observed": result.get("observed"),
-        },
+        metadata=metadata,
     )
 
 
