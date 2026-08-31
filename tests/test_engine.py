@@ -821,6 +821,10 @@ class TestOrchestratorHappyPath:
         (repo / "README.md").write_text("base")
         subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
         subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True, env=env)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
 
         policy = tmp_path / "delivery.yaml"
         policy.write_text((tmp_path / "default.yaml").read_text() if (tmp_path / "default.yaml").exists() else "")
@@ -849,6 +853,24 @@ class TestOrchestratorHappyPath:
             repo_path=str(repo),
             policy_path=str(policy),
         )
+        real_gate = orch._eval_gate
+        staged_evaluations = []
+
+        class StagedGate:
+            async def run(self, evaluated_task, result, budget):
+                staged = Path(evaluated_task.workspace.path)
+                assert staged != repo
+                assert (staged / "artifacts" / "auth.txt").read_text() == "auth"
+                assert (staged / "artifacts" / "db.txt").read_text() == "db"
+                assert not (repo / "artifacts").exists()
+                assert subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                    capture_output=True, text=True,
+                ).stdout.strip() == base_sha
+                staged_evaluations.append(staged)
+                return await real_gate.run(evaluated_task, result, budget)
+
+        orch._eval_gate = StagedGate()
         task = TaskContract(
             goal="deliver explicit work",
             task_type=TaskType.MULTI_FILE_REFACTOR,
@@ -867,6 +889,8 @@ class TestOrchestratorHappyPath:
         assert result["outcome"] == "completed"
         assert (repo / "artifacts" / "auth.txt").read_text() == "auth"
         assert (repo / "artifacts" / "db.txt").read_text() == "db"
+        assert len(staged_evaluations) == 1
+        assert not staged_evaluations[0].exists()
         assert all(record.status.value == "cleaned" for record in records)
 
     @pytest.mark.asyncio
