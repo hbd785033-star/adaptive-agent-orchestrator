@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 from collections.abc import Iterator
 from enum import StrEnum
@@ -252,6 +253,8 @@ class ExecutionWorkspace:
     task_id: str
     execution_id: str
     base_sha: str
+    symbolic_head: str | None
+    root_refs: tuple[tuple[str, str], ...]
     cleaned: bool = False
 
     @classmethod
@@ -281,6 +284,8 @@ class ExecutionWorkspace:
         path = root / task_id / execution_id
         branch = f"agent/{task_id}/{execution_id}"
         base_sha = _git(repo, ["rev-parse", "HEAD"]).strip()
+        symbolic_head = _symbolic_head(repo)
+        root_refs = _refs_snapshot(repo)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             _git(repo, ["worktree", "add", "-b", branch, str(path), base_sha])
@@ -297,6 +302,8 @@ class ExecutionWorkspace:
             task_id=task_id,
             execution_id=execution_id,
             base_sha=base_sha,
+            symbolic_head=symbolic_head,
+            root_refs=root_refs,
         )
 
     @property
@@ -319,7 +326,7 @@ class ExecutionWorkspace:
         )
 
     def integrate(self) -> None:
-        """Commit and merge this workspace, rolling back on any error."""
+        """Deliver this workspace through guarded off-root staging."""
         if self.cleaned:
             raise RuntimeError("execution workspace is already cleaned")
         try:
@@ -338,41 +345,48 @@ class ExecutionWorkspace:
                         f"agent({self.execution_id}): deliver {self.task_id}",
                     ],
                 )
-            _git(
+            child_sha = _git(self.path, ["rev-parse", "HEAD"]).strip()
+            staged_sha = _stage_branch_merge(
                 self.repo_path,
-                [
-                    "-c",
-                    "user.name=Adaptive Agent Orchestrator",
-                    "-c",
-                    "user.email=adaptive-agent-orchestrator@users.noreply.github.com",
-                    "merge",
-                    "--no-ff",
-                    self.branch,
-                    "-m",
-                    f"integrate {self.task_id}/{self.execution_id}",
-                ],
+                self.branch,
+                self.base_sha,
+                self.task_id,
+                self.execution_id,
+            )
+            _remove_staging_or_raise(
+                self.repo_path,
+                _staging_path(self.repo_path, self.task_id, self.execution_id),
+            )
+            _assert_child_tip(self.repo_path, self.branch, child_sha)
+            _deliver_staged(
+                self.repo_path,
+                staged_sha,
+                self.base_sha,
+                self.symbolic_head,
+                self.root_refs,
+                self.branch,
             )
             self.cleanup()
         except Exception:
-            self.rollback()
+            with contextlib.suppress(RuntimeError):
+                self.rollback()
             raise
 
     def rollback(self) -> None:
-        """Restore the integration base and remove all execution artifacts."""
+        """Remove AAO artifacts without mutating the user repository."""
         if self.cleaned:
             return
-        with contextlib.suppress(RuntimeError):
-            _git(self.repo_path, ["merge", "--abort"])
-        current = _git(self.repo_path, ["rev-parse", "HEAD"]).strip()
-        if current != self.base_sha:
-            _git(self.repo_path, ["reset", "--merge", self.base_sha])
         _assert_no_merge_state(self.repo_path)
-        dirty = _git(
-            self.repo_path, ["status", "--porcelain", "--untracked-files=all"]
+        errors = _remove_workspace_artifacts(self.repo_path, self.path, self.branch)
+        errors.extend(
+            _remove_staging_artifacts(
+                self.repo_path,
+                _staging_path(self.repo_path, self.task_id, self.execution_id),
+            )
         )
-        if dirty.strip():
-            raise RuntimeError("root repository is not clean after rollback")
-        self.cleanup()
+        if errors:
+            raise RuntimeError("workspace cleanup failed: " + "; ".join(errors))
+        self.cleaned = True
 
     def cleanup(self) -> None:
         """Remove all artifacts and claim success only after postcondition checks."""
@@ -441,6 +455,23 @@ class WorktreeRecord:
     worktree_path: Path
     branch: str
     status: WorktreeStatus = WorktreeStatus.ALLOCATED
+    base_sha: str | None = None
+    symbolic_head: str | None = None
+    root_refs: tuple[tuple[str, str], ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class StagedDelivery:
+    """Combined delegated result awaiting one guarded root delivery."""
+
+    task_id: str
+    path: Path
+    staged_sha: str
+    base_sha: str
+    symbolic_head: str | None
+    root_refs: tuple[tuple[str, str], ...]
+    child_branches: tuple[str, ...]
+    child_tips: tuple[tuple[str, str], ...]
 
 
 class WorkspaceManager:
@@ -499,6 +530,11 @@ class WorkspaceManager:
                 )
         worktree_path = self._base / task_id / child_id
         branch = f"agent/{task_id}/{child_id}"
+        _assert_no_merge_state(self._repo)
+        self.ensure_root_clean()
+        base_sha = self.current_head()
+        symbolic_head = _symbolic_head(self._repo)
+        root_refs = _refs_snapshot(self._repo)
 
         # Create branch + worktree in a single atomic git command.
         # Do NOT `git checkout -b` first — that checks the branch out in the main
@@ -525,6 +561,9 @@ class WorkspaceManager:
             worktree_path=worktree_path,
             branch=branch,
             status=WorktreeStatus.ALLOCATED,
+            base_sha=base_sha,
+            symbolic_head=symbolic_head,
+            root_refs=root_refs,
         )
         self._records[(task_id, child_id)] = record
         return record
@@ -546,14 +585,9 @@ class WorkspaceManager:
             raise RuntimeError("root repository has tracked or untracked changes")
 
     def rollback(self, base_sha: str) -> None:
-        """Atomically return the clean root to its pre-integration commit."""
-        with contextlib.suppress(RuntimeError):
-            _git(self._repo, ["merge", "--abort"])
-        _git(self._repo, ["reset", "--merge", base_sha])
-        if self.current_head() != base_sha:
-            raise RuntimeError("root rollback could not restore integration base")
+        """Leave the user repository untouched during rollback."""
+        del base_sha
         _assert_no_merge_state(self._repo)
-        self.ensure_root_clean()
 
     def commit_changes(self, task_id: str, child_id: str) -> str:
         """Commit all child worktree changes and return the child branch tip."""
@@ -572,24 +606,118 @@ class WorkspaceManager:
         return _git(record.worktree_path, ["rev-parse", "HEAD"]).strip()
 
     def integrate(self, task_id: str, child_id: str) -> None:
-        """Merge a validated child branch into the root repository."""
+        """Deliver a validated child branch through guarded staging."""
         record = self._get(task_id, child_id)
         record.status = WorktreeStatus.MERGING
         try:
-            _git(
+            base_sha = record.base_sha or self.current_head()
+            symbolic_head = record.symbolic_head
+            root_refs = record.root_refs or _refs_snapshot(self._repo)
+            child_sha = _git(self._repo, ["rev-parse", record.branch]).strip()
+            staged_sha = _stage_branch_merge(
                 self._repo,
-                [
-                    "-c", "user.name=Adaptive Agent Orchestrator",
-                    "-c", "user.email=adaptive-agent-orchestrator@users.noreply.github.com",
-                    "merge", "--no-ff", record.branch,
-                    "-m", f"integrate {record.task_id}/{record.child_id}",
-                ],
+                record.branch,
+                base_sha,
+                record.task_id,
+                record.child_id,
+            )
+            _remove_staging_or_raise(
+                self._repo,
+                _staging_path(self._repo, record.task_id, record.child_id),
+            )
+            _assert_child_tip(self._repo, record.branch, child_sha)
+            _deliver_staged(
+                self._repo,
+                staged_sha,
+                base_sha,
+                symbolic_head,
+                root_refs,
+                record.branch,
             )
         except RuntimeError:
             with contextlib.suppress(RuntimeError):
-                _git(self._repo, ["merge", "--abort"])
+                _remove_staging_or_raise(
+                    self._repo,
+                    _staging_path(self._repo, record.task_id, record.child_id),
+                )
             record.status = WorktreeStatus.ABANDONED
             raise
+
+    def stage_batch(self, task_id: str, child_ids: list[str]) -> StagedDelivery:
+        """Combine child branches off-root and leave the result available for eval."""
+        if not child_ids:
+            raise RuntimeError("cannot stage an empty delivery batch")
+        records = [self._get(task_id, child_id) for child_id in child_ids]
+        boundary = records[0]
+        base_sha = boundary.base_sha or self.current_head()
+        symbolic_head = boundary.symbolic_head
+        root_refs = boundary.root_refs or _refs_snapshot(self._repo)
+        if any(
+            (record.base_sha or base_sha) != base_sha
+            or record.symbolic_head != symbolic_head
+            for record in records
+        ):
+            raise RuntimeError("delegated workspaces do not share a delivery boundary")
+
+        child_branches = tuple(record.branch for record in records)
+        child_tips = tuple(
+            (record.branch, _git(self._repo, ["rev-parse", record.branch]).strip())
+            for record in records
+        )
+        path = _staging_path(self._repo, task_id, "batch")
+        for record in records:
+            record.status = WorktreeStatus.MERGING
+        try:
+            staged_sha = _stage_branch_merges(
+                self._repo,
+                child_branches,
+                base_sha,
+                task_id,
+                "batch",
+            )
+        except RuntimeError:
+            for record in records:
+                record.status = WorktreeStatus.ABANDONED
+            raise
+        return StagedDelivery(
+            task_id=task_id,
+            path=path,
+            staged_sha=staged_sha,
+            base_sha=base_sha,
+            symbolic_head=symbolic_head,
+            root_refs=root_refs,
+            child_branches=child_branches,
+            child_tips=child_tips,
+        )
+
+    def deliver_batch(self, delivery: StagedDelivery) -> None:
+        """Deliver an accepted staged batch with one guarded target-ref update."""
+        try:
+            _remove_staging_or_raise(self._repo, delivery.path)
+            for branch, expected_sha in delivery.child_tips:
+                _assert_child_tip(self._repo, branch, expected_sha)
+            _deliver_staged(
+                self._repo,
+                delivery.staged_sha,
+                delivery.base_sha,
+                delivery.symbolic_head,
+                delivery.root_refs,
+                delivery.child_branches,
+            )
+        except RuntimeError:
+            with contextlib.suppress(RuntimeError):
+                _remove_staging_or_raise(self._repo, delivery.path)
+            for child_id in (
+                record.child_id
+                for record in self._records.values()
+                if record.task_id == delivery.task_id
+            ):
+                self._get(delivery.task_id, child_id).status = WorktreeStatus.ABANDONED
+            raise
+
+    def discard_batch(self, delivery: StagedDelivery) -> None:
+        """Remove a rejected staged batch without changing the user root."""
+        _remove_staging_or_raise(self._repo, delivery.path)
 
     def abandon(self, task_id: str, child_id: str) -> None:
         """Eval failed — keep worktree intact for human inspection."""
@@ -620,6 +748,169 @@ class WorkspaceManager:
         if key not in self._records:
             raise KeyError(f"No worktree record for task={task_id} child={child_id}")
         return self._records[key]
+
+
+def _staging_path(repo: Path, task_id: str, execution_id: str) -> Path:
+    repo_key = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
+    return (
+        repo.parent
+        / f".aao-root-delivery-{repo_key}"
+        / task_id
+        / execution_id
+    )
+
+
+def _remove_staging_artifacts(repo: Path, path: Path) -> list[str]:
+    errors: list[str] = []
+    try:
+        registered = _worktree_registered(repo, path)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        registered = False
+    if registered:
+        try:
+            _git(repo, ["worktree", "remove", "--force", str(path)])
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    elif path.exists():
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            errors.append(f"staging path removal failed: {path}: {exc}")
+    if path.exists():
+        errors.append(f"staging path still exists: {path}")
+    try:
+        if _worktree_registered(repo, path):
+            errors.append(f"staging worktree still registered: {path}")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+    return errors
+
+
+def _remove_staging_or_raise(repo: Path, path: Path) -> None:
+    errors = _remove_staging_artifacts(repo, path)
+    if errors:
+        raise RuntimeError("staging cleanup failed: " + "; ".join(errors))
+
+
+def _stage_branch_merge(
+    repo: Path,
+    branch: str,
+    base_sha: str,
+    task_id: str,
+    execution_id: str,
+) -> str:
+    return _stage_branch_merges(
+        repo, (branch,), base_sha, task_id, execution_id
+    )
+
+
+def _stage_branch_merges(
+    repo: Path,
+    branches: tuple[str, ...],
+    base_sha: str,
+    task_id: str,
+    execution_id: str,
+) -> str:
+    path = _staging_path(repo, task_id, execution_id)
+    _remove_staging_or_raise(repo, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _git(repo, ["worktree", "add", "--detach", str(path), base_sha])
+        for branch in branches:
+            _git(
+                path,
+                [
+                    "-c",
+                    "user.name=Adaptive Agent Orchestrator",
+                    "-c",
+                    "user.email=adaptive-agent-orchestrator@users.noreply.github.com",
+                    "merge",
+                    "--no-ff",
+                    branch,
+                    "-m",
+                    f"integrate {task_id}/{execution_id}/{branch.rsplit('/', 1)[-1]}",
+                ],
+            )
+        return _git(path, ["rev-parse", "HEAD"]).strip()
+    except RuntimeError as exc:
+        cleanup_errors = _remove_staging_artifacts(repo, path)
+        if cleanup_errors:
+            raise RuntimeError(
+                f"{exc}; staging cleanup failed: {'; '.join(cleanup_errors)}"
+            ) from exc
+        raise
+
+
+def _assert_child_tip(repo: Path, branch: str, expected_sha: str) -> None:
+    current = _git(repo, ["rev-parse", branch]).strip()
+    if current != expected_sha:
+        raise RuntimeError("root delivery boundary changed: child ref")
+
+
+def _assert_delivery_boundary(
+    repo: Path,
+    expected_head: str | None,
+    expected_symbolic_head: str | None,
+    expected_refs: tuple[tuple[str, str], ...],
+    excluded_ref: str | tuple[str, ...],
+    *,
+    check_worktree: bool = True,
+) -> None:
+    _assert_no_merge_state(repo)
+    if _symbolic_head(repo) != expected_symbolic_head:
+        raise RuntimeError("root delivery boundary changed: symbolic HEAD")
+    if expected_head is not None and _git(repo, ["rev-parse", "HEAD"]).strip() != expected_head:
+        raise RuntimeError("root delivery boundary changed: HEAD")
+    if check_worktree and _git(repo, ["status", "--porcelain", "--untracked-files=all"]).strip():
+        raise RuntimeError("root delivery boundary changed: working tree")
+    excluded = (excluded_ref,) if isinstance(excluded_ref, str) else excluded_ref
+    excluded_refs = {
+        value
+        for branch in excluded
+        for value in (branch, f"refs/heads/{branch}")
+    }
+    before = {
+        name: sha for name, sha in expected_refs if name not in excluded_refs
+    }
+    after = {
+        name: sha
+        for name, sha in _refs_snapshot(repo)
+        if name not in excluded_refs
+    }
+    if before != after:
+        raise RuntimeError("root delivery boundary changed: refs")
+
+
+def _deliver_staged(
+    repo: Path,
+    staged_sha: str,
+    base_sha: str,
+    symbolic_head: str | None,
+    root_refs: tuple[tuple[str, str], ...],
+    child_branch: str | tuple[str, ...],
+) -> None:
+    _assert_delivery_boundary(
+        repo, base_sha, symbolic_head, root_refs, child_branch
+    )
+    target_ref = symbolic_head or "HEAD"
+    _git(repo, ["update-ref", target_ref, staged_sha, base_sha])
+    expected_refs = dict(root_refs)
+    if symbolic_head is not None:
+        expected_refs[symbolic_head] = staged_sha
+    _assert_delivery_boundary(
+        repo,
+        None,
+        symbolic_head,
+        tuple(sorted(expected_refs.items())),
+        child_branch,
+        check_worktree=False,
+    )
+    _git(repo, ["reset", "--merge", staged_sha])
+    if _symbolic_head(repo) != symbolic_head:
+        raise RuntimeError("root delivery boundary changed: symbolic HEAD")
+    if _git(repo, ["rev-parse", "HEAD"]).strip() != staged_sha:
+        raise RuntimeError("root delivery failed to update HEAD")
 
 
 def _git(repo: Path, args: list[str]) -> str:

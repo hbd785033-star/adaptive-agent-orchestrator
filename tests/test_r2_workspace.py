@@ -11,6 +11,7 @@ from orchestrator.workspace import (
     ExecutionWorkspace,
     RepositoryBaseline,
     WorkspaceUnavailableError,
+    _staging_path,
 )
 
 
@@ -64,6 +65,160 @@ def test_execution_workspace_rollback_removes_all_artifacts(tmp_path):
     assert _git(repo, "status", "--porcelain") == ""
     assert not workspace.path.exists()
     assert workspace.cleaned
+
+
+def test_execution_workspace_rollback_never_resets_moved_root(tmp_path):
+    repo = _repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    workspace = ExecutionWorkspace.create(repo, task_id="task-rollback-boundary")
+
+    (repo / "user.txt").write_text("user change\n")
+    _git(repo, "add", "user.txt")
+    _git(repo, "commit", "-m", "user commit")
+    moved = _git(repo, "rev-parse", "HEAD")
+
+    workspace.rollback()
+
+    assert _git(repo, "rev-parse", "HEAD") == moved
+    assert _git(repo, "rev-parse", "HEAD") != base
+    assert not workspace.path.exists()
+    assert workspace.cleaned
+
+
+def test_execution_workspace_rollback_preserves_active_user_merge(tmp_path):
+    repo = _repo(tmp_path)
+    workspace = ExecutionWorkspace.create(repo, task_id="task-merge-boundary")
+    merge_head = repo / ".git" / "MERGE_HEAD"
+    merge_head.write_text(_git(repo, "rev-parse", "HEAD") + "\n")
+
+    with pytest.raises(RuntimeError, match="merge state"):
+        workspace.rollback()
+
+    assert merge_head.exists()
+    assert _git(repo, "rev-parse", "HEAD") == workspace.base_sha
+    assert not workspace.cleaned
+    merge_head.unlink()
+
+
+def test_execution_workspace_delivery_preserves_active_user_merge(tmp_path):
+    repo = _repo(tmp_path)
+    workspace = ExecutionWorkspace.create(repo, task_id="task-merge-delivery")
+    (workspace.path / "allowed.txt").write_text("delivered\n")
+    merge_head = repo / ".git" / "MERGE_HEAD"
+    merge_head.write_text(_git(repo, "rev-parse", "HEAD") + "\n")
+
+    with pytest.raises(RuntimeError, match="merge state"):
+        workspace.integrate()
+
+    assert merge_head.exists()
+    assert _git(repo, "rev-parse", "HEAD") == workspace.base_sha
+    assert not (repo / "allowed.txt").exists()
+    assert not workspace.cleaned
+    merge_head.unlink()
+
+
+def test_execution_workspace_blocks_branch_switch_before_delivery(tmp_path):
+    repo = _repo(tmp_path)
+    workspace = ExecutionWorkspace.create(repo, task_id="task-branch-boundary")
+    (workspace.path / "allowed.txt").write_text("delivered\n")
+
+    _git(repo, "switch", "-c", "user-branch")
+    root_before = _git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(RuntimeError, match="delivery boundary"):
+        workspace.integrate()
+
+    assert _git(repo, "symbolic-ref", "--short", "HEAD") == "user-branch"
+    assert _git(repo, "rev-parse", "HEAD") == root_before
+    assert not (repo / "allowed.txt").exists()
+    assert not workspace.path.exists()
+    assert workspace.cleaned
+
+
+def test_execution_workspace_blocks_unexpected_ref_movement(tmp_path):
+    repo = _repo(tmp_path)
+    workspace = ExecutionWorkspace.create(repo, task_id="task-ref-boundary")
+    (workspace.path / "allowed.txt").write_text("delivered\n")
+    _git(repo, "branch", "unexpected-ref")
+
+    with pytest.raises(RuntimeError, match="ref"):
+        workspace.integrate()
+
+    assert not (repo / "allowed.txt").exists()
+    assert not workspace.path.exists()
+    assert workspace.cleaned
+
+
+def test_execution_workspace_guarded_target_ref_rejects_racing_movement(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    workspace = ExecutionWorkspace.create(repo, task_id="task-target-ref-race")
+    (workspace.path / "allowed.txt").write_text("delivered\n")
+    target_ref = workspace.symbolic_head
+    assert target_ref is not None
+    tree = _git(repo, "rev-parse", f"{workspace.base_sha}^{{tree}}")
+    unexpected_sha = _git(
+        repo,
+        "commit-tree",
+        tree,
+        "-p",
+        workspace.base_sha,
+        "-m",
+        "concurrent target movement",
+    )
+    real_git = workspace_module._git
+    moved = False
+
+    def move_target_before_guarded_update(path, args):
+        nonlocal moved
+        if not moved and args[:2] == ["update-ref", target_ref]:
+            moved = True
+            _git(repo, "update-ref", target_ref, unexpected_sha, workspace.base_sha)
+        return real_git(path, args)
+
+    monkeypatch.setattr(workspace_module, "_git", move_target_before_guarded_update)
+
+    with pytest.raises(RuntimeError, match="update-ref"):
+        workspace.integrate()
+
+    assert moved
+    assert _git(repo, "rev-parse", target_ref) == unexpected_sha
+    assert (repo / "seed.txt").read_text() == "seed\n"
+    assert not (repo / "allowed.txt").exists()
+    assert not workspace.path.exists()
+    assert workspace.cleaned
+
+
+def test_execution_workspace_merges_in_off_root_staging_and_runs_hooks(tmp_path):
+    repo = _repo(tmp_path)
+    hook_log = tmp_path.parent / "merge-hook.log"
+    hook = repo / ".git" / "hooks" / "post-merge"
+    hook.write_text('#!/bin/sh\nprintf "%s\\n" "$PWD" >> "' + hook_log.as_posix() + '"\n')
+    hook.chmod(0o755)
+    workspace = ExecutionWorkspace.create(repo, task_id="task-staging")
+    (workspace.path / "allowed.txt").write_text("delivered\n")
+
+    workspace.integrate()
+
+    hook_paths = hook_log.read_text().splitlines()
+    assert any(path != str(repo) for path in hook_paths)
+    assert (repo / "allowed.txt").read_text() == "delivered\n"
+    assert not workspace.path.exists()
+
+
+def test_execution_workspace_removes_stale_off_root_staging_before_delivery(tmp_path):
+    repo = _repo(tmp_path)
+    workspace = ExecutionWorkspace.create(repo, task_id="task-stale-staging")
+    stale = _staging_path(repo, workspace.task_id, workspace.execution_id)
+    stale.mkdir(parents=True)
+    (stale / "stale.txt").write_text("stale\n")
+    (workspace.path / "allowed.txt").write_text("delivered\n")
+
+    workspace.integrate()
+
+    assert not stale.exists()
+    assert (repo / "allowed.txt").read_text() == "delivered\n"
 
 
 def test_execution_workspace_fails_closed_without_git_repo(tmp_path):
@@ -125,16 +280,16 @@ def test_cleanup_rejects_active_root_merge_state(tmp_path):
     merge_head.unlink()
 
 
-def test_rollback_rejects_residual_root_mutation_and_does_not_claim_clean(tmp_path):
+def test_rollback_preserves_residual_root_mutation_and_cleans_artifacts(tmp_path):
     repo = _repo(tmp_path)
     workspace = ExecutionWorkspace.create(repo, task_id="task-7", execution_id="single")
     (repo / "residual.txt").write_text("unsafe root mutation\n")
 
-    with pytest.raises(RuntimeError, match="root repository is not clean"):
-        workspace.rollback()
+    workspace.rollback()
 
-    assert not workspace.cleaned
-    assert workspace.path.exists()
+    assert (repo / "residual.txt").read_text() == "unsafe root mutation\n"
+    assert workspace.cleaned
+    assert not workspace.path.exists()
 
 
 def test_repository_baseline_attributes_ignored_mutations_not_existing_state(tmp_path):

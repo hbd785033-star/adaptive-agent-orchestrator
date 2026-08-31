@@ -41,6 +41,7 @@ from orchestrator.state_machine import StateMachine, TaskRecord, TaskStatus
 from orchestrator.workspace import (
     ExecutionWorkspace,
     RepositoryBaseline,
+    StagedDelivery,
     WorkspaceManager,
 )
 from storage.database import Database
@@ -1166,6 +1167,7 @@ class Orchestrator:
                 )
             try:
                 trusted_files: list[str] = []
+                staged_delivery: StagedDelivery | None = None
                 for wt_record in records:
                     child_files = trusted_changed_files(
                         wt_record.worktree_path, base_sha=integration_base
@@ -1179,22 +1181,36 @@ class Orchestrator:
 
                 for wt_record in records:
                     self._wm.commit_changes(task.id, wt_record.child_id)
-                    self._wm.integrate(task.id, wt_record.child_id)
+
+                staged_delivery = self._wm.stage_batch(
+                    task.id, [wt_record.child_id for wt_record in records]
+                )
 
                 aggregate = delegation_result.aggregate_result
                 if aggregate is None:
                     raise RuntimeError("delegation produced no aggregate result")
-                integrated_eval = await self._eval_gate.run(task, aggregate, budget)
+                integrated_task = inject_constraints(task, staged_delivery.path)
+                integrated_task.context["_eval_base_sha"] = integration_base
+                integrated_eval = await self._eval_gate.run(
+                    integrated_task, aggregate, budget
+                )
                 if integrated_eval.overall != EvalStatus.PASS:
                     failed = ", ".join(
                         check.name for check in integrated_eval.failed_checks()
                     )
                     raise RuntimeError(f"integrated eval failed: {failed}")
+                self._wm.deliver_batch(staged_delivery)
+                staged_delivery = None
                 for wt_record in records:
                     self._wm.clean(task.id, wt_record.child_id)
                 await record.mark_completed()
             except Exception as exc:
                 failures = []
+                if staged_delivery is not None:
+                    try:
+                        self._wm.discard_batch(staged_delivery)
+                    except Exception as discard_exc:
+                        failures.append(f"staging cleanup failed: {discard_exc}")
                 try:
                     self._wm.rollback(integration_base)
                 except Exception as rollback_exc:
