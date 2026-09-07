@@ -48,6 +48,9 @@ def build_runtime_entry(
     *,
     hermes_url: str,
     hermes_key: str | None,
+    codex_home: str | Path | None = None,
+    codex_launch_command: list[str] | None = None,
+    codex_timeout_seconds: float = 300.0,
 ):
     """Bounded composition mapping; selection remains RuntimeSelectionPolicy-owned."""
     if runtime_name == "hermes":
@@ -58,7 +61,38 @@ def build_runtime_entry(
         from adapters.codex.app_server import CodexAppServerAdapter
 
         return "codex-app-server", CodexAppServerAdapter()
+    if runtime_name == "codex-native-exec":
+        if codex_home is None:
+            raise ValueError("codex-native-exec requires explicit codex_home")
+        from adapters.codex.exec import CodexExecAdapter, CodexExecControl
+
+        control = CodexExecControl(
+            codex_home=Path(codex_home),
+            run_timeout_seconds=codex_timeout_seconds,
+        )
+        return runtime_name, CodexExecAdapter(
+            control=control,
+            launch_command=codex_launch_command,
+        )
     raise ValueError(f"unsupported runtime identity: {runtime_name}")
+
+
+def build_codex_native_exec_composition(runtime: object) -> dict[str, object]:
+    """Return the sole-candidate, planned, no-retry Native Exec composition."""
+    from contracts.runtime_selection import RuntimeSelectionPolicy
+    from orchestrator.runtime_registry import RuntimeRegistry
+
+    identity = "codex-native-exec"
+    return {
+        "runtime_registry": RuntimeRegistry(entries=[(identity, runtime)]),
+        "runtime_selection_policy": RuntimeSelectionPolicy(
+            policy_version="runtime-selection-codex-native-exec-v1",
+            runtime_priority=(identity,),
+            allow_degraded_fallback=False,
+        ),
+        "planning_required": True,
+        "max_retries": 0,
+    }
 
 
 def _build_execution_record(
@@ -145,6 +179,12 @@ def run(
     policy: str = typer.Option("policies/default.yaml", "--policy", help="Policy YAML path"),
     repo: str = typer.Option(".", "--repo", help="Repo path for worktree and evals"),
     runtime_name: str = typer.Option("hermes", "--runtime", help="Explicit runtime identity"),
+    codex_home: Path | None = typer.Option(  # noqa: B008
+        None, "--codex-home", help="Explicit CODEX_HOME for codex-native-exec"
+    ),
+    codex_timeout_seconds: float = typer.Option(
+        300.0, "--codex-timeout-seconds", help="Host hard timeout for codex-native-exec"
+    ),
     mock: bool = typer.Option(False, "--mock", help="Use mock adapter (no live Hermes)"),
     record_out: Path | None = typer.Option(None, "--record-out", help="Write ExecutionRecord 0.1 JSON"),  # noqa: B008
 ) -> None:
@@ -162,6 +202,8 @@ def run(
         policy=policy,
         repo=repo,
         runtime_name=runtime_name,
+        codex_home=codex_home,
+        codex_timeout_seconds=codex_timeout_seconds,
         mock=mock,
         record_out=record_out,
     ))
@@ -201,6 +243,8 @@ async def _run_task(**kwargs) -> None:  # noqa: ANN003
             kwargs["runtime_name"],
             hermes_url=kwargs["hermes_url"],
             hermes_key=kwargs["hermes_key"],
+            codex_home=kwargs.get("codex_home"),
+            codex_timeout_seconds=kwargs.get("codex_timeout_seconds", 300.0),
         )
 
     started_at = datetime.now(UTC)
@@ -208,7 +252,9 @@ async def _run_task(**kwargs) -> None:  # noqa: ANN003
         "policy_path": kwargs["policy"],
         "repo_path": kwargs["repo"],
     }
-    if runtime_identity == "codex-app-server":
+    if runtime_identity == "codex-native-exec":
+        build_kwargs.update(build_codex_native_exec_composition(runtime))
+    elif runtime_identity == "codex-app-server":
         from contracts.runtime_selection import RuntimeSelectionPolicy
         from orchestrator.runtime_registry import RuntimeRegistry
 
