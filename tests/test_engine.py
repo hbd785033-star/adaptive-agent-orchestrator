@@ -16,7 +16,7 @@ from contracts.task import SubtaskSpec, TaskContract, TaskType
 from orchestrator.engine import Orchestrator
 
 
-async def build_orch(tmp_path: Path, runtime) -> Orchestrator:
+async def build_orch(tmp_path: Path, runtime, *, max_retries: int | None = None) -> Orchestrator:
     """Helper: build Orchestrator pointed at a temp DB and tmp policy."""
     import os
     import subprocess
@@ -25,7 +25,7 @@ async def build_orch(tmp_path: Path, runtime) -> Orchestrator:
         subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
         subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
         subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
-        (tmp_path / ".gitignore").write_text(".worktrees/\n*.db\n*.db-*\n*.yaml\n")
+        (tmp_path / ".gitignore").write_text(".worktrees/\n*.db\n*.db-*\n*.yaml\n*.log\n")
         subprocess.run(["git", "add", ".gitignore"], cwd=tmp_path, check=True)
         subprocess.run(
             ["git", "commit", "-m", "test bootstrap"],
@@ -77,7 +77,75 @@ worktree:
         db_path=str(tmp_path / "test.db"),
         repo_path=str(tmp_path),
         policy_path=str(policy),
+        max_retries=max_retries,
     )
+
+
+class IgnoredFileWritingAdapter(MockHermesAdapter):
+    async def submit(self, task):
+        assert task.workspace is not None
+        (Path(task.workspace.path) / "secret.log").write_text("not authorized", encoding="utf-8")
+        return await super().submit(task)
+
+
+@pytest.mark.asyncio
+async def test_build_max_retries_zero_prevents_eval_retry(tmp_path):
+    adapter = MockHermesAdapter()
+    adapter.enqueue_scenario("pass", files_changed=["outside.py"])
+    async with await build_orch(tmp_path, adapter, max_retries=0) as orch:
+        result = await orch.run(
+            TaskContract(goal="change only fixture", allowed_paths=["fixture.py"], complexity=1)
+        )
+    assert result["outcome"] == "failed"
+    assert result["retry_count"] == 0
+    assert len(adapter._runs) == 1
+
+
+@pytest.mark.asyncio
+async def test_build_rejects_negative_max_retries(tmp_path):
+    with pytest.raises(ValueError, match="max_retries"):
+        await build_orch(tmp_path, MockHermesAdapter(), max_retries=-1)
+
+
+@pytest.mark.asyncio
+async def test_inclusive_final_scope_rejects_ignored_file_before_integration(tmp_path):
+    adapter = IgnoredFileWritingAdapter()
+    adapter.enqueue_scenario("pass", files_changed=[])
+    async with await build_orch(tmp_path, adapter, max_retries=0) as orch:
+        result = await orch.run(
+            TaskContract(goal="change only fixture", allowed_paths=["fixture.py"], complexity=1)
+        )
+    assert result["outcome"] == "failed"
+    assert "secret.log" in result["detail"]
+    assert not (tmp_path / "secret.log").exists()
+
+
+@pytest.mark.asyncio
+async def test_eval_lint_disables_verifier_cache_before_inclusive_scope(
+    tmp_path, monkeypatch
+):
+    from contracts.evaluation import EvalStatus
+    from evals import gate
+
+    captured: list[str] = []
+
+    class CompletedRuff:
+        returncode = 0
+
+        @staticmethod
+        async def communicate():
+            return b"", None
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured.extend(args)
+        return CompletedRuff()
+
+    monkeypatch.setattr(gate.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await gate.check_lint(tmp_path, ["fixture.py"])
+
+    assert result.status == EvalStatus.PASS
+    assert captured == ["ruff", "check", "--no-cache", "fixture.py"]
 
 
 class TestOrchestratorHappyPath:

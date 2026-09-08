@@ -1,12 +1,18 @@
 """Generic result/export contracts required by Codex Runtime-B."""
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
-from aao_cli.main import _build_execution_record, build_runtime_entry
+from aao_cli.main import (
+    _build_execution_record,
+    build_codex_native_exec_composition,
+    build_runtime_entry,
+)
 from adapters.codex.app_server import CodexAppServerAdapter
+from adapters.codex.exec import CodexExecAdapter
 from adapters.hermes.gateway import HermesAdapter
 from adapters.mock import MockHermesAdapter
 from contracts.execution import SuccessCriterion
@@ -352,6 +358,169 @@ def test_bounded_runtime_factory_knows_adapters_but_not_selection_policy():
     assert isinstance(hermes, HermesAdapter)
     assert codex_identity == "codex-app-server"
     assert isinstance(codex, CodexAppServerAdapter)
+
+
+def test_native_exec_factory_requires_explicit_home_and_keeps_identity_distinct(tmp_path):
+    identity, runtime = build_runtime_entry(
+        "codex-native-exec",
+        hermes_url="ws://localhost:4999",
+        hermes_key=None,
+        codex_home=tmp_path,
+        codex_launch_command=["fake-codex"],
+    )
+    assert identity == "codex-native-exec"
+    assert isinstance(runtime, CodexExecAdapter)
+    assert runtime.runtime_id != "codex-app-server"
+
+
+def test_native_exec_composition_is_planned_single_candidate_and_zero_retry(tmp_path):
+    _, runtime = build_runtime_entry(
+        "codex-native-exec",
+        hermes_url="ws://localhost:4999",
+        hermes_key=None,
+        codex_home=tmp_path,
+        codex_launch_command=["fake-codex"],
+    )
+    composition = build_codex_native_exec_composition(runtime)
+    assert composition["runtime_registry"].identities() == ("codex-native-exec",)
+    policy = composition["runtime_selection_policy"]
+    assert policy.runtime_priority == ("codex-native-exec",)
+    assert policy.allow_degraded_fallback is False
+    assert composition["planning_required"] is True
+    assert composition["max_retries"] == 0
+
+
+def test_execution_record_preserves_native_exec_truth_and_unknowns():
+    result = {
+        "outcome": "completed",
+        "run_id": "run-native",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "cached_tokens": 3,
+            "estimated_cost_usd": None,
+        },
+        "tool_calls": [{"type": "command_execution", "exit_code": 0}],
+        "files_changed": ["fixture.py"],
+        "observed": {
+            "runtime_adapter": "codex-native-exec",
+            "runtime_adapter_invoked": True,
+            "runtime_version": "0.149.1",
+            "run_id": "run-native",
+            "session_id": "thread-native",
+            "runtime_status": "completed",
+            "model": "gpt-5.6-sol",
+            "provider": "openai",
+            "output": "done",
+            "provenance": {
+                "controlled_experiment_provenance_complete": True,
+                "observed_windows_backend": None,
+            },
+        },
+    }
+    record = _build_execution_record(
+        task_id="task",
+        result=result,
+        mock=False,
+        started_at="2026-09-02T00:00:00Z",
+        finished_at="2026-09-02T00:00:01Z",
+    )
+    assert record.schema_version == "0.1"
+    assert record.run_id == "run-native"
+    assert record.model == "gpt-5.6-sol"
+    assert record.provider == "openai"
+    assert record.cached_tokens == 3
+    assert record.cost_usd is None
+    assert record.files_changed == ["fixture.py"]
+    assert record.output == "done"
+    assert record.metadata["observed"]["session_id"] == "thread-native"
+    assert record.metadata["observed"]["provenance"]["observed_windows_backend"] is None
+
+
+@pytest.mark.asyncio
+async def test_native_exec_composition_runs_real_hmc_before_one_runtime_submission(tmp_path):
+    from model_council.inventory import ModelSpec
+
+    class PlannedNativeRuntime(MockHermesAdapter):
+        def __init__(self):
+            super().__init__()
+            self.submit_calls = 0
+
+        async def connect(self):
+            return None
+
+        async def submit(self, task):
+            self.submit_calls += 1
+            return await super().submit(task)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "fixture.py").write_text('value = "old"\n', encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "fixture.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
+    policy = tmp_path / "policy.yaml"
+    policy.write_text(
+        """policy_version: routing-v1.0
+routing:
+  delegation:
+    min_independent_subtasks: 2
+    min_estimated_input_tokens: 8000
+    allowed_task_types: [multi_file_refactor]
+  single:
+    max_complexity: 2
+    max_affected_modules: 1
+  constraints:
+    sequential_dependency_forces_single: true
+budget:
+  max_children: 2
+  max_depth: 1
+  max_retries: 1
+  max_total_calls: 8
+  require_approval_above_calls: 5
+approval:
+  always_require: []
+  require_for_risk_levels: [3, 4]
+worktree:
+  base_path: .worktrees
+  readonly_task_types: [parallel_research, code_review]
+""",
+        encoding="utf-8",
+    )
+    runtime = PlannedNativeRuntime()
+    runtime.enqueue_scenario("pass", runtime="codex-native-exec", summary="planned")
+    composition = build_codex_native_exec_composition(runtime)
+    inventory = [
+        ModelSpec(
+            provider="openai",
+            model="gpt-5.6-sol",
+            family="openai",
+            is_current=True,
+            reasoning=True,
+            fast=True,
+            healthy=True,
+        )
+    ]
+    async with await Orchestrator.build(
+        **composition,
+        db_path=str(tmp_path / "native-planning.db"),
+        repo_path=str(repo),
+        policy_path=str(policy),
+        model_discoverer=lambda: inventory,
+    ) as orchestrator:
+        result = await orchestrator.run(
+            TaskContract(goal="Return planned", complexity=1, allowed_paths=[])
+        )
+    assert result["outcome"] == "completed"
+    assert result["planned"]["hmc"]["request_type"] == "PlannerRequest"
+    assert result["planned"]["hmc"]["recommendation_type"] == "PlannerRecommendation"
+    assert result["planned"]["runtime_selection"]["selected_runtime"] == "codex-native-exec"
+    assert result["planned"]["runtime_plan"]["executor"] == "codex-native-exec"
+    assert result["planned"]["runtime_plan"]["execution_mode"] == "direct"
+    assert runtime.submit_calls == 1
+    assert result["retry_count"] == 0
 
 
 @pytest.mark.asyncio

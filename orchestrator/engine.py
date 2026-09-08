@@ -26,7 +26,7 @@ from contracts.result import AgentResult, RunStatus
 from contracts.runtime_health import HealthStatus, RuntimeHealth
 from contracts.runtime_selection import RuntimeSelectionPolicy
 from contracts.task import TaskContract
-from evals.gate import DeterministicEvalGate, trusted_changed_files
+from evals.gate import DeterministicEvalGate, check_paths, trusted_changed_files
 from orchestrator.budget import ApprovalGate, BudgetConfig, BudgetState
 from orchestrator.candidate_filter import RuntimeCandidate
 from orchestrator.delegation_executor import DelegationExecutor
@@ -209,8 +209,12 @@ class Orchestrator:
         runtime_selection_policy: RuntimeSelectionPolicy | None = None,
         runtime_health_by_runtime: dict[str, RuntimeHealth] | None = None,
         planning_required: bool | None = None,
+        max_retries: int | None = None,
     ) -> Orchestrator:
         import yaml
+
+        if max_retries is not None and max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
 
         db = Database(Path(db_path))
         await db.connect()
@@ -220,7 +224,11 @@ class Orchestrator:
         budget_config = BudgetConfig(
             max_children=budget_cfg_raw.get("max_children", 2),
             max_depth=budget_cfg_raw.get("max_depth", 1),
-            max_retries=budget_cfg_raw.get("max_retries", 1),
+            max_retries=(
+                budget_cfg_raw.get("max_retries", 1)
+                if max_retries is None
+                else max_retries
+            ),
             max_total_calls=budget_cfg_raw.get("max_total_calls", 8),
             require_approval_above_calls=budget_cfg_raw.get("require_approval_above_calls", 5),
         )
@@ -886,6 +894,13 @@ class Orchestrator:
                     )
             try:
                 trusted_files = workspace.changed_files()
+                inclusive_path_check = check_paths(
+                    agent_result.model_copy(update={"files_changed": trusted_files}),
+                    guarded_task,
+                    repo_path=workspace.path,
+                )
+                if inclusive_path_check.status == EvalStatus.FAIL:
+                    raise RuntimeError(inclusive_path_check.detail)
                 if write_task:
                     workspace.integrate()
                 else:
