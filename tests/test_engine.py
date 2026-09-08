@@ -120,6 +120,34 @@ async def test_inclusive_final_scope_rejects_ignored_file_before_integration(tmp
     assert not (tmp_path / "secret.log").exists()
 
 
+@pytest.mark.asyncio
+async def test_eval_lint_disables_verifier_cache_before_inclusive_scope(
+    tmp_path, monkeypatch
+):
+    from contracts.evaluation import EvalStatus
+    from evals import gate
+
+    captured: list[str] = []
+
+    class CompletedRuff:
+        returncode = 0
+
+        @staticmethod
+        async def communicate():
+            return b"", None
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured.extend(args)
+        return CompletedRuff()
+
+    monkeypatch.setattr(gate.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await gate.check_lint(tmp_path, ["fixture.py"])
+
+    assert result.status == EvalStatus.PASS
+    assert captured == ["ruff", "check", "--no-cache", "fixture.py"]
+
+
 class TestOrchestratorHappyPath:
     @staticmethod
     def _deny_approval(orch):

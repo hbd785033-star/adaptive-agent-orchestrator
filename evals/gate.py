@@ -274,7 +274,7 @@ async def check_lint(repo_path: str | Path, changed_files: list[str]) -> EvalChe
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ruff", "check", *py_files,
+            "ruff", "check", "--no-cache", *py_files,
             cwd=repo_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
